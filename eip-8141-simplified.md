@@ -1,0 +1,1092 @@
+---
+eip: 8141
+title: Frame Transaction
+description: Add frame abstraction for transaction validation, execution, and gas payment
+author: Vitalik Buterin (@vbuterin), lightclient (@lightclient), Felix Lange (@fjl), Yoav Weiss (@yoavw), Alex Forshtat (@forshtat), Dror Tirosh (@drortirosh), Shahaf Nacson (@shahafn), Derek Chiang (@derekchiang), Toni Wahrstätter (@nerolation)
+discussions-to: https://ethereum-magicians.org/t/frame-transaction/27617
+status: Draft
+type: Standards Track
+category: Core
+created: 2026-01-29
+requires: 1559, 2718, 3607, 4844, 7623, 7702
+---
+
+## Abstract
+
+Adds a new transaction whose validity and gas payment can be defined abstractly. This is achieved by decomposing the transaction into a sequence of *frames* which are contract calls that validate the transaction, approve gas payment, and execute standard user operations.
+
+## Motivation
+
+The frame transaction type offers UX and security benefits across many areas:
+
+- it provides a native off-ramp from the elliptic curve based cryptographic system used to authenticate transactions today, to post-quantum (PQ) secure systems.
+- accounts are unlinked from their ECDSA keys, allowing native key rotation
+- smart accounts become simpler and therefore safer by natively providing batch call processing
+- alternative fee payment schemes are supported without centralized, third party relayers
+- the default account gives the protocol an even stronger guarantee on the lowest common denominator of account functionality
+ 
+Ultimately, frame transactions realize the original vision of account abstraction: an account simply becomes an address with code. It leverages the EVM to support arbitrary *user-defined* definitions of validation and gas payment.
+
+## Specification
+
+### Constants
+
+| Name                       | Value             |
+|----------------------------|-------------------|
+| `FRAME_TX_TYPE`            | `0x06`            |
+| `FRAME_TX_INTRINSIC_COST`  | `15000`           |
+| `FRAME_TX_PER_FRAME_COST`  | `475`             |
+| `ENTRY_POINT`              | `address(0xaa)`   |
+| `MAX_FRAMES`               | `64`              |
+| `CANONICAL_EXPIRY_CODE`    | `0x60083614600a575f5ffd5b5f3560c01c4211601657005b5f5ffd` |
+
+### Frame Transaction
+
+A new [EIP-2718](./eip-2718.md) transaction with type `FRAME_TX_TYPE` is introduced. Transactions of this type are referred to as **frame transactions**.
+
+#### Payload Encoding
+
+The payload is defined as the RLP serialization of the following:
+
+```
+[chain_id, nonce, sender, frames, signatures, max_priority_fee_per_gas, max_fee_per_gas, max_fee_per_blob_gas, blob_versioned_hashes]
+
+frames = [[kind, modifiers, target, gas_limit, value, data], ...]
+signatures = [[scheme, signer, msg, signature], ...]
+```
+
+#### Field Definitions
+
+Below are high-level definitions of each field in the transaction definition. Detailed behavior is defined in subsequent sections.
+
+##### Outer transaction payload
+
+- `chain_id` -- the chain ID in which the transaction is valid.
+- `nonce` -- nonce of the sender to prevent replays.
+- `sender` -- the address of the intended sender of the transaction.
+- `frames` -- list of frames to execute.
+- `signatures` -- list of validated signatures available to the transaction.
+- `max_priority_fee_per_gas` -- the EIP-1559 priority fee per gas the transaction will pay.
+- `max_fee_per_gas` -- the maximum EIP-1559 fee the transaction is willing to pay, per gas.
+- `max_fee_per_blob_gas` -- the maximum EIP-4844 fee per blob gas the transaction is willing to pay. Must be `0` if `blob_versioned_hashes` is empty.
+- `blob_versioned_hashes` -- list of EIP-4844 blob versioned hashes.
+
+##### Frame object
+
+- `kind` -- the execution mechanism of the frame: its caller identity, its side-effect class (execute vs validate), and, for validation frames, the maximum approval scope it may grant. See [Frame kind](#frame-kind).
+- `modifiers` -- orthogonal per-frame modifiers that compose with any `kind` (currently only the atomic-batch bit). See [Frame modifiers](#frame-modifiers).
+- `target` -- the destination or `to` address for the frame.
+- `gas_limit` -- the maximum gas allowed to be execute in pursuit of the frame.
+- `value` -- the amount in wei that should transferred from the `sender` as part of the frame execution.
+- `data` -- the calldata provided to the top level call frame.
+
+##### Signature object
+
+- `scheme` -- the verification scheme used to interpret the raw signature bytes.
+- `signer` -- scheme-dependent signer metadata; for `SECP256K1` and `P256`, this is a 20-byte address.
+- `msg` -- either empty, indicating the canonical transaction signature hash, or an explicit 32-byte digest.
+- `signature` -- raw signature bytes interpreted according to `scheme`.
+
+##### Frame kind
+
+The `kind` of a frame is its complete *execution mechanism*. It is the merger of three correlated properties that previous designs split between a `mode` field and an approval-scope flag:
+
+- **Caller identity** -- the value of `CALLER`/`ORIGIN` for the frame: the protocol address `ENTRY_POINT`, or the account principal `tx.sender`.
+- **Side-effect class** -- whether the frame *executes* (full state access) or *validates* (`STATICCALL`-restricted except [approval effects](#approval-effects); a revert invalidates the whole transaction).
+- **Allowed approval scope** -- for validation frames only, the maximum [`APPROVE`](#approve-instruction-0xaa) scope the frame may grant.
+
+These are not independent: an allowed approval scope is only meaningful for a validation frame, so it is folded into the same field rather than carried separately. The caller-identity and side-effect-class axes form a 2×2 space; the (caller = `tx.sender`, class = validate) cell is meaningless (the sender's own validation runs with caller `ENTRY_POINT` targeting `tx.sender`) and is therefore not assigned a `kind`.
+
+| `kind` | Name                       | Caller        | Class    | Allowed `APPROVE` scope         |
+|--------|----------------------------|---------------|----------|---------------------------------|
+| 0      | `DEFAULT`                  | `ENTRY_POINT` | execute  | none                            |
+| 1      | `SENDER`                   | `tx.sender`   | execute  | none                            |
+| 2      | `VERIFY`                   | `ENTRY_POINT` | validate | `APPROVE_NONE`                  |
+| 3      | `VERIFY_PAYMENT`           | `ENTRY_POINT` | validate | `APPROVE_PAYMENT`               |
+| 4      | `VERIFY_EXECUTION`         | `ENTRY_POINT` | validate | `APPROVE_EXECUTION`             |
+| 5      | `VERIFY_PAYMENT_EXECUTION` | `ENTRY_POINT` | validate | `APPROVE_EXECUTION_AND_PAYMENT` |
+
+The four `VERIFY*` kinds are collectively the **validation frames**. A validation frame whose `APPROVE` call requests a scope exceeding its kind's allowed scope is invalid; this lets the public mempool read the declared scope statically from `kind` without simulating the frame.
+
+##### Frame modifiers
+
+The `modifiers` field is an orthogonal bitfield that composes with any `kind`. Bit positions are zero-based, least-significant bit numbered `0`.
+
+| Bit | Name           | Meaning                                                              |
+|-----|----------------|---------------------------------------------------------------------|
+| 0   | `ATOMIC_BATCH` | This frame joins a contiguous all-or-nothing group with the next frame. |
+| 1+  | reserved       | Reserved for future orthogonal, per-frame lifecycle modifiers (e.g. commit/reveal). Must be zero. |
+
+Unlike `kind`, which encodes correlated mechanism properties, `modifiers` carries properties that are independent of mechanism and therefore must not be merged into `kind` (doing so would multiply the kind space). Purpose- or lifecycle-style extensions belong here or in the mempool's [recognized templates](#recognized-frame-templates), never as new `kind` values.
+
+#### Constraints
+
+Some validity constraints can be determined statically. They are outlined below:
+
+```python
+assert tx.chain_id < 2**256
+assert tx.nonce < 2**64
+assert len(tx.frames) > 0 and len(tx.frames) <= MAX_FRAMES
+assert len(tx.sender) == 20
+
+for sig in tx.signatures:
+    if sig.scheme in [SECP256K1, P256]:
+        assert len(sig.signer) == 20
+    else:
+        invalid_transaction()
+    if len(sig.msg) == 0:
+        assert sig.msg == Bytes()
+    elif len(sig.msg) == 32:
+        assert sig.msg != b"\x00" * 32
+    else:
+        invalid_transaction()
+
+total_frame_gas = 0
+for frame in tx.frames:
+    assert frame.kind < 6
+    assert frame.modifiers < 2                         # only ATOMIC_BATCH (bit 0) defined; bits 1+ reserved
+    assert frame.target is None or len(frame.target) == 20
+    assert frame.gas_limit <= 2**64 - 1
+    assert frame.value < 2**256
+    assert frame.kind == SENDER or frame.value == 0
+    total_frame_gas += frame.gas_limit
+    assert total_frame_gas <= 2**64 - 1
+
+    # The ATOMIC_BATCH modifier requires a subsequent frame to batch with.
+    if frame.modifiers & ATOMIC_BATCH:
+        assert i + 1 < len(tx.frames)                  # must not be last frame
+```
+
+#### Transaction Signatures
+
+The `signatures` list contains signatures that may be referenced by `VERIFY` frames and by ordinary EVM execution. Every signature in this list must validate successfully before any frame is executed. If any signature is malformed or invalid, the whole transaction is invalid.
+
+The `signatures` list is optional. Contracts may still ignore it entirely and perform bespoke signature verification inside frame execution.
+
+The raw `signature` byte strings are intentionally not introspectable by EVM code to allow future aggregation schemes. Contracts can inspect only the metadata of the signature list through transaction introspection.
+
+The `scheme` identifies how the raw `signature` bytes are interpreted.
+
+| `scheme`   | Name         | `signature` encoding                           | Gas cost |
+|------------|--------------|------------------------------------------------|----------|
+| 0x0        | `SECP256K1`  | `v (1 byte) || r (32 bytes) || s (32 bytes)` | 2800     |
+| 0x1        | `P256`       | `r || s || qx || qy` (all 32 bytes)          | 6700     |
+| 0x2..255   | reserved     | reserved                                       | reserved |
+
+For `SECP256K1` and `P256`, the `signer` is a 20-byte Ethereum address.
+
+The `msg` which message the signature authorizes:
+
+- if `len(msg) == 0`, the signature is signed over `compute_sig_hash(tx)`
+- if `len(msg) == 32`, the signature is signed the explicit 32-byte digest `msg`
+- any other `msg` length is invalid
+
+The explicit 32-byte zero digest is invalid. This reserves the zero stack value as the EVM-visible representation of the transaction signing hash case.
+
+For `P256`, the signer address must be `keccak256(qx || qy)[12:]`.
+
+#### Receipt Encoding
+
+The `ReceiptPayload` is defined as:
+
+```
+[cumulative_gas_used, payer, [frame_receipt, ...]]
+frame_receipt = [status, gas_used, logs]
+```
+
+`payer` is the address of the account that paid the fees for the transaction. `status` is the return code of the top-level call. A new code `0x3` is introduced for frames which are skipped due to failed atomic batch.
+
+#### Signature Hash
+
+The canonical signature hash is defined such that any signature with empty `msg` will have its raw `signature` bytes elided:
+
+```python
+def compute_sig_hash(tx: FrameTx) -> Hash:
+    for i, sig in enumerate(tx.signatures):
+        if len(sig.msg) == 0:
+            tx.signatures[i].signature = Bytes()
+    return keccak(bytes([FRAME_TX_TYPE]) + rlp(tx))
+```
+
+#### Signature Validation
+
+Every signature in the outer transaction object is validated before frame execution. The validation rules are:
+
+```python
+SECP256K1 = 0x0
+P256      = 0x1
+
+def effective_signer(sig) -> Address:
+    return sig.signer
+
+def validate_signature(sig, tx, sig_hash) -> bool:
+    if len(sig.msg) == 0:
+        msg = sig_hash
+    elif len(sig.msg) == 32:
+        if sig.msg == b"\x00" * 32:
+            return False
+        msg = sig.msg
+    else:
+        return False
+
+    if sig.scheme == SECP256K1:
+        if len(sig.signature) != 65:
+            return False
+        v = sig.signature[0]
+        r = sig.signature[1:33]
+        s = sig.signature[33:65]
+        return sig.signer == ecrecover(msg, v, r, s)
+
+    elif sig.scheme == P256:
+        if len(sig.signature) != 128:
+            return False
+        r  = sig.signature[0:32]
+        s  = sig.signature[32:64]
+        qx = sig.signature[64:96]
+        qy = sig.signature[96:128]
+        if sig.signer != keccak256(qx + qy)[12:]:
+            return False
+        return P256VERIFY(msg, r, s, qx, qy)
+
+    else:
+        return False
+```
+
+#### Expiry Frame
+
+An **expiry frame** is a `VERIFY` frame whose `resolved_target` runtime code equals `CANONICAL_EXPIRY_CODE`. It is the canonical instance of a [recognized frame template](#recognized-frame-templates): an ordinary contract call, special only in that the public mempool recognizes it and relaxes its rules for it.
+
+At consensus level no special handling is required. The expiry contract is a normal contract; it interprets `frame.data` as an 8-byte unsigned big-endian expiry timestamp and reverts unless `block.timestamp <= expiry_timestamp`. The `TIMESTAMP` read needs no consensus exception because `STATICCALL`-restricted `VERIFY` frames already permit reads; the opcode is only restricted by the public-mempool rules, which exempt this template (see [Recognized Frame Templates](#recognized-frame-templates)).
+
+The canonical runtime code is, in assembly:
+
+```asm
+push1 0x08
+calldatasize
+eq
+push1 0x0a
+jumpi
+push0
+push0
+revert
+
+jumpdest
+push0
+calldataload
+push1 0xc0
+shr
+timestamp
+gt
+push1 0x16
+jumpi
+stop
+
+jumpdest
+push0
+push0
+revert
+```
+
+Equivalently, the runtime behavior is:
+
+```python
+if len(evm.calldata) != 8:
+    revert()
+
+expiry_timestamp = int.from_bytes(evm.calldata, "big")
+if evm.timestamp > expiry_timestamp:
+    revert()
+
+stop()
+```
+
+No predeploy is installed. An instance is deployed like any other contract (for example via the [EIP-7997](./eip-7997.md) deterministic factory, giving a cross-chain-stable address); recognition is by runtime-code equality, not by address. Clients may omit the explicit EVM execution and directly perform the deadline check, provided the externally observable result is identical to executing the canonical code.
+
+#### Behavior
+
+When processing a frame transaction, perform the following steps.
+
+To begin processing a frame transaction:
+
+1. Ensure `tx.nonce == state[tx.sender].nonce`
+1. Compute the canonical transaction signature hash: `sig_hash = compute_sig_hash(tx)`.
+1. For each `sig` in `tx.signatures`, ensure `validate_signature(sig, tx, sig_hash) == true`.
+1. Initialize transaction-scoped variables:
+    - `payer = None`
+    - `sender_approved = false`
+1. Let `resolved_target = frame.target if frame.target is not None else tx.sender`
+    - Unless otherwise stated, checks that refer to the target account during execution use the resolved target.
+
+Then for each frame:
+
+1. Execute a call with the specified `kind`, `modifiers`, `resolved_target`, `gas_limit`, `value`, and `data`.
+   - Determine the frame's **caller** from its `kind`: `tx.sender` for `SENDER`; `ENTRY_POINT` for all other kinds.
+   - **General execution-approval rule.** If `caller` is an account principal `P` (i.e. `caller == tx.sender`), the frame may run only if `P` has produced an execution-approval effect (`sender_approved == true`). If it has not, the transaction is invalid. The protocol principal `ENTRY_POINT` is approved implicitly and needs no prior approval.
+   - In the top-level frame call, `CALLVALUE` is `frame.value`.
+   - As with an ordinary `CALL`, if the caller does not have sufficient balance to transfer `frame.value`, the frame reverts.
+   - If `resolved_target` code hash is empty, i.e. `0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470`, execute the logic described in [default code](#default-code).
+   - Otherwise, if `resolved_target` uses an [EIP-7702](./eip-7702.md) delegation indicator, execute according to [EIP-7702](./eip-7702.md)'s delegated-code semantics.
+   - The `ORIGIN` opcode returns frame `caller` throughout all call depths.
+   - If a frame's execution reverts, its state changes are discarded, except for committed [approval effects](#approval-effects). Additionally, if this frame has the `ATOMIC_BATCH` modifier set, mark all subsequent frames in the same atomic group as skipped.
+2. If the frame's `kind` is a validation frame (`VERIFY`, `VERIFY_PAYMENT`, `VERIFY_EXECUTION`, or `VERIFY_PAYMENT_EXECUTION`) the following additional requirements are imposed:
+    - Execute the frame as a `STATICCALL`, disallowing state manipulation, except for the [approval effects](#approval-effects): the `APPROVE` instruction, and `SSTORE` to the `resolved_target`'s own storage.
+    - An `APPROVE` requesting a scope exceeding the kind's allowed approval scope (see [Frame kind](#frame-kind)) is invalid.
+    - If the frame reverts, the transaction is invalid.
+3. If a frame is part of an atomic batch and it fails, unroll the associated atomic batch.
+    - An **atomic batch** is a maximal contiguous sequence of frames `[i, j]` where `j > i`, frames `i` through `j - 1` have the `ATOMIC_BATCH` modifier set, and frame `j` does not.
+    - When a frame in the batch fails, the state must be rolled back to the condition it was immediately before the atomic batch began, except for committed [approval effects](#approval-effects), which persist. All remaining frames in the atomic batch are skipped.
+    - Since skipped frames are not executed, the gas value allotted to them is refunded at the end of the transaction.
+    - If the frame does not have an associated atomic batch, further special
+      handling is not needed, simple revert the individual frame.
+
+After executing all frames, verify that `payer` has been set (i.e. `payer != None`). If `payer` is set, refund any unpaid gas to the payer. If it is not, the whole transaction is invalid.
+
+##### Cross-frame interactions
+
+A few cross-frame interactions to note:
+
+- For the purposes of gas accounting of warm / cold state status, the journal of such touches is shared across frames.
+- Discard the `TSTORE` and `TLOAD` transient storage between frames.
+
+##### Gas Accounting
+
+The total gas limit of the transaction is:
+
+```
+def signature_gas(sig):
+    if sig.scheme == SECP256K1:
+        return 2800
+    if sig.scheme == P256:
+        return 6700
+    invalid_transaction()
+
+signature_verification_cost = sum(signature_gas(sig) for sig in tx.signatures)
+
+tx_gas_limit = (
+    FRAME_TX_INTRINSIC_COST
+    + len(tx.frames) * FRAME_TX_PER_FRAME_COST
+    + calldata_cost(rlp(tx.signatures))
+    + calldata_cost(rlp(tx.frames))
+    + signature_verification_cost
+    + sum(frame.gas_limit for all frames)
+)
+```
+
+Where `calldata_cost` is calculated per standard [EIP-7623](./eip-7623.md) rules.
+
+The calldata cost for `rlp(tx.signatures)` is charged over the signature objects exactly as included in the transaction, including the scheme-dependent `signer` bytes.
+
+The total fee is defined as:
+
+```
+tx_fee = tx_gas_limit * effective_gas_price + blob_fees
+blob_fees = len(blob_versioned_hashes) * GAS_PER_BLOB * blob_base_fee
+```
+
+The `effective_gas_price` is calculated per [EIP-1559](./eip-1559.md) and `blob_fees` is calculated as per [EIP-4844](./eip-4844.md).
+
+Any `frame.value` transferred by `SENDER` frames is separate from `tx_fee` and follows ordinary `CALL` value-transfer semantics. The gas cost of sending `frame.value` is the same as for any `CALL` instruction.
+
+Each frame has its own `gas_limit` allocation. Unused gas from a frame is **not** available to subsequent frames. After all frames execute, the gas refund is calculated as:
+
+```
+refund = sum(frame.gas_limit for all frames) - total_gas_used
+```
+
+This refund is returned to the gas payer (the `resolved_target` that called `APPROVE(APPROVE_PAYMENT)` or `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)`) and added back to the block gas pool.
+
+##### Default code
+
+Frame transactions can be used by accounts who do not have deployed code, nor an [EIP-7702](./eip-7702.md) delegation indicator via the "default code" mechanism. The behavior of the default code is defined below:
+
+- If the frame is a validation frame (its `kind` is one of the `VERIFY*` kinds):
+  - Let `allowed_scope` be the kind's allowed approval scope (see [Frame kind](#frame-kind)). If `allowed_scope == APPROVE_NONE`, revert.
+  - If `allowed_scope & APPROVE_EXECUTION != 0` and `resolved_target != tx.sender`, revert.
+  - If there is no `SECP256K1` signature `sig` such that `sig.signer == resolved_target` and `sig.msg == Bytes()`, revert.
+  - Call `APPROVE(allowed_scope)`.
+- If the frame's `kind` is `SENDER` or `DEFAULT`:
+  - Return successfully as if calling empty code.
+
+### Approval Effects
+
+An **approval effect** is a state change made inside a frame that exits successfully (via `RETURN`, `STOP`, or `APPROVE`) and that must persist independently of later-frame reverts and atomic-batch rollback. There are exactly two:
+
+1. **Approval-flag updates.** The `APPROVE` instruction's updates to the transaction-scoped values `payer` and `sender_approved`.
+2. **Own-storage writes in validation frames.** An `SSTORE` performed during a validation frame (any `VERIFY*` kind) to the `resolved_target`'s own storage (whether written directly or via `DELEGATECALL` from `resolved_target`).
+
+Journaling rules:
+
+- If a frame **reverts**, its approval effects are discarded with the rest of its revert journal.
+- If a frame **exits successfully**, its approval effects are committed and MUST NOT be reverted by later-frame reverts, atomic-batch rollback, or any other in-transaction mechanism.
+
+In a validation frame all other state mutation remains forbidden (the frame runs as a `STATICCALL`); an `SSTORE` to storage other than `resolved_target`'s own reverts the frame. Own-storage `SSTORE` is priced under ordinary [EIP-2200](./eip-2200.md) rules, with no first-use surcharge beyond what `SSTORE` already charges.
+
+This matches the [ERC-7562](./eip-7562.md) `[STO-010]` rule ("access to the account's own storage is always allowed" during validation) under which ERC-4337 validators have operated since 2024. The slots written are tracked by the mempool as revalidation dependencies; the public mempool admits such writes only for [recognized frame templates](#recognized-frame-templates), so the relaxation is gated by the "start strict, relax for known frames" policy rather than granted to arbitrary verifier code.
+
+### `APPROVE` Instruction (`0xaa`)
+
+The `APPROVE` instruction exits the current EVM call frame successfully and updates the transaction-scoped approval context based on the `scope` operand. Its updates to `payer` and `sender_approved` are [approval effects](#approval-effects).
+
+#### Stack
+
+| Stack      | Value        |
+| ---------- | ------------ |
+| `top - 0`  | `offset`     |
+| `top - 1`  | `length`     |
+| `top - 2`  | `scope`      |
+
+#### Scope Operand
+
+The `scope` operand is a bitmask. Define the following constants:
+
+- `APPROVE_NONE` (`0x0`): No approval scope allowed - the current frame is not allowed to approve any scope.
+- `APPROVE_PAYMENT` (`0x1`): Approval of payment - the contract approves paying the total gas cost for the transaction.
+- `APPROVE_EXECUTION` (`0x2`): Approval of execution - the sender contract approves future frames calling on its behalf.
+   - Note this is only valid when `resolved_target` equals `tx.sender`.
+- `APPROVE_EXECUTION_AND_PAYMENT` (`0x3`): Approval of payment and execution.
+
+The scope a frame requests via `APPROVE` must not exceed the allowed approval scope of its [`kind`](#frame-kind).
+
+### Introspection
+
+The instructions in this section provide the needed introspection capabilities of the new frame transaction type and the frame objects themselves, including some runtime information like the execution result status.
+
+#### `TXPARAM` Instruction `(0xb0)`
+
+This instruction gives access to transaction-scoped information. The gas cost of this operation is `2`. It takes one value from the stack, `param`, and returns the associated transaction value to the stack. See the table for the full mapping.
+
+| `param` | Return value                                                                |
+|---------|-----------------------------------------------------------------------------|
+| 0x00    | current transaction type                                                    |
+| 0x01    | `nonce`                                                                     |
+| 0x02    | `sender`                                                                    |
+| 0x03    | `max_priority_fee_per_gas`                                                  |
+| 0x04    | `max_fee_per_gas`                                                           |
+| 0x05    | `max_fee_per_blob_gas`                                                      |
+| 0x06    | max cost (basefee=max, all gas used, includes blob cost, intrinsic cost, and signature verification cost) |
+| 0x07    | `len(blob_versioned_hashes)`                                                |
+| 0x08    | `compute_sig_hash(tx)`                                                      |
+| 0x09    | `len(frames)`                                                               |
+| 0x0A    | currently executing frame index                                             |
+| 0x0B    | `len(signatures)`                                                           |
+
+
+Undefined `param` values result in an exceptional halt.
+
+#### `FRAMEDATALOAD` Instruction `0xb1`
+
+This opcode loads one 32-byte word of data from frame input. Gas cost: 3 (matches CALLDATALOAD).
+
+It takes two values from the stack, an `offset` and `frameIndex`.
+It places the retrieved data on the stack.
+
+When the `frameIndex` is out-of-bounds, an exceptional halt occurs.
+
+The operation semantics match CALLDATALOAD, returning a word of data from the chosen
+frame's `data`, starting at the given byte `offset`.
+
+#### `FRAMEDATACOPY` Instruction (`0xb2`)
+
+This opcode copies data frame input into the contract's memory. Its gas cost is calculated
+exactly as for `CALLDATACOPY`, including the fixed cost of 3, the per-word copy cost, and
+the standard EVM memory expansion cost.
+
+It takes four values from the stack: `memOffset`, `dataOffset`, `length` and `frameIndex`.
+No stack output value is produced.
+
+When the `frameIndex` is out-of-bounds, an exceptional halt occurs.
+
+The operation semantics match CALLDATACOPY, copying `length` bytes from the chosen frame's
+`data`, starting at the given byte `dataOffset`, into a memory region starting at
+`memOffset`.
+
+#### `FRAMEPARAM` Instruction (`0xb3`)
+
+This instruction gives access to frame-scoped information. The gas cost of this operation is `2`. It takes two values from the stack, `frameIndex` on top and `param` second from top.
+
+| `param` | `frameIndex` | Return value                                              |
+|---------|--------------|-----------------------------------------------------------|
+| 0x00    | frameIndex   | `resolved_target`                                         |
+| 0x01    | frameIndex   | `gas_limit`                                               |
+| 0x02    | frameIndex   | `kind`                                                    |
+| 0x03    | frameIndex   | `modifiers`                                               |
+| 0x04    | frameIndex   | `len(data)`                                               |
+| 0x05    | frameIndex   | `status` (exceptional halt if current/future)             |
+| 0x06    | frameIndex   | `allowed_scope` (the `kind`'s allowed approval scope; `APPROVE_NONE` for `DEFAULT`/`SENDER`) |
+| 0x07    | frameIndex   | `atomic_batch` (`frame.modifiers & ATOMIC_BATCH`, returns 0/1) |
+| 0x08    | frameIndex   | `value`                                                   |
+
+Notes:
+
+- The `status` field (0x05) returns `0` for failure or `1` for success.
+- Undefined `param` values result in an exceptional halt.
+- Out-of-bounds access for `frameIndex` results in an exceptional halt.
+- Attempting to access the return `status` of the current frame or a subsequent frame results in an exceptional halt.
+
+
+#### `SIGPARAM` Instruction (`0xb4`)
+
+This instruction gives access to signature-scoped metadata. The raw `signature` bytes are intentionally not accessible from the EVM. The gas cost of this operation is `2`. It takes two values from the stack, `signatureIndex` on top and `param` second from top.
+
+| `param` | `signatureIndex` | Return value       |
+|---------|------------------|--------------------|
+| 0x00    | signatureIndex   | effective signer address |
+| 0x01    | signatureIndex   | `scheme`           |
+| 0x02    | signatureIndex   | `msg`              |
+| 0x03    | signatureIndex   | `len(signature)`   |
+
+Notes:
+
+- Undefined `param` values result in an exceptional halt.
+- Out-of-bounds access for `signatureIndex` results in an exceptional halt.
+
+### Mempool
+
+The transaction mempool must carefully handle frame transactions, as a naive implementation could introduce denial-of-service vulnerabilities. The fundamental goal of the public mempool rules is to avoid allowing an arbitrary number of transactions to be invalidated by a single environmental change or state modification. Beyond this, the rules also aim to minimize the amount of work needed to complete the initial validation phase of a transaction before an acceptance decision can be made.
+
+This policy is inspired by [ERC-7562](./eip-7562.md), but removes staking and reputation entirely. Any behavior that ERC-7562 would admit only for a staked or reputable third party is rejected here for the public mempool. Transactions outside these rules may be accepted into a local or private mempool, but must not be propagated through the public mempool.
+
+#### Constants
+
+| Name  | Value  | Description  |
+|---|---|---|
+| `MAX_VERIFY_GAS`   | `100_000`  | Maximum amount of gas a node should expend validating signatures and simulating the validation prefix |
+| `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER`   | `1`  | Maximum amount of pending transactions that can be using any given non-canonical paymaster |
+
+#### Validation Prefix
+
+The **validation prefix** of a frame transaction is the shortest prefix of frames whose successful execution sets `payer`.
+
+Public mempool rules apply only to the validation prefix. Once `payer` has been set, subsequent frames are outside public mempool validation and may be arbitrary. In particular, `user_op` and `post_op` occur after payment approval and are therefore not subject to the public mempool restrictions below.
+
+For public mempool accounting, signature validation is treated as part of the transaction intrinsic cost and counts against `MAX_VERIFY_GAS`.
+
+#### Policy Summary
+
+A frame transaction is eligible for public mempool propagation only if its validation prefix depends exclusively on:
+
+1. transaction fields, including the canonical signature hash,
+2. the block timestamp as read by an expiry frame,
+3. the sender's nonce, code, and storage,
+4. if a deploy frame is present, the code of the factory targeted by that frame (subject to the deploy-frame trace rules below),
+5. if a paymaster frame is present, either a canonical paymaster instance together with explicit paymaster balance reservation, or a non-canonical paymaster being used by less than `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER` pending transactions,
+6. the code of any other existing non-delegated contracts reached during validation via `CALL*` or `EXTCODE*`, provided the resulting trace does not access disallowed mutable state.
+
+Any dependency on third-party mutable state outside these categories must result in rejection by the public mempool.
+
+#### Recognized Frame Templates
+
+The public-mempool rules in this section are deliberately strict: by default a validation-prefix frame may not read the block environment, write state outside `tx.sender`, or depend on third-party mutable state. These restrictions are **public-mempool admission policy, not consensus rules** — a block builder may include any frame transaction whose execution is valid at consensus, regardless of these rules.
+
+Because the restrictions are admission policy, they can be **relaxed for specific recognized code** without any consensus change. A **recognized frame template** is a frame whose verifier resolves to code the mempool recognizes, in exchange for which the mempool grants a declared set of relaxations from the generic [trace rules](#validation-trace-rules) and [banned opcodes](#banned-opcodes). The initial recognized set is intentionally small:
+
+| Template | Recognized by | Relaxations granted |
+|---|---|---|
+| Default code | empty code hash (`tx.sender` has no contract code and no [EIP-7702](./eip-7702.md) delegation) | the built-in [default-code](#default-code) validate/approve behavior; own-storage writes to `tx.sender` |
+| Canonical expiry | `resolved_target` runtime code equals `CANONICAL_EXPIRY_CODE` | `TIMESTAMP` permitted; exempt from trace rules, storage-dependency tracking, and `MAX_VERIFY_GAS`; transaction dropped once the deadline passes (see [Expiry Frame](#expiry-frame-1)) |
+| Canonical paymaster | `pay` frame `resolved_target` runtime code exactly matches the canonical paymaster implementation | exempt from the generic trace and opcode rules; admitted via code match plus the [paymaster accounting](#paymasters) rules |
+
+This list is versioned public-mempool policy. New templates (recognized smart-account verifiers, future paymaster versions, alternative expiry contracts, guarantor-backed admission, and so on) MAY be added over time, each with its own declared relaxations, **without modifying the consensus specification**. The "start strict, relax for known frames" model lets the public mempool begin with the minimal recognized set above and broaden it as templates are standardized and audited.
+
+#### Kind Subclassifications
+
+While the frames are designed to be generic, we refine some frame kinds for the purpose of specifying public mempool handling clearly. These are *purposes* the mempool recognizes, not new consensus kinds.
+
+| Name  | Kind  | Description  |
+|---|---|---|
+| `self_verify`   | `VERIFY_PAYMENT_EXECUTION`  | Validates the transaction and approves both sender and payer |
+| `deploy`  | `DEFAULT` | Deploys a new smart account, typically via a deterministic factory such as the [EIP-7997](./eip-7997.md) predeploy |
+| `only_verify`  | `VERIFY_EXECUTION`  | Validates the transaction and approves only the sender |
+| `pay`  | `VERIFY_PAYMENT` | Validates the transaction and approves only the payer |
+| `expiry_verify` | `VERIFY` | An [expiry frame](#expiry-frame): `resolved_target` runtime code equals `CANONICAL_EXPIRY_CODE` |
+| `user_op` | `SENDER` | Executes the intended user operation |
+| `post_op` | `DEFAULT` | Executes an optional post-op action as needed by the paymaster |
+
+
+#### Public Mempool-recognized Validation Prefixes
+
+The public mempool recognizes four validation prefixes. Structural rules are enforced only up to and including the frame that sets `payer`.
+
+##### Self Relay
+
+###### Basic Transaction
+
+```
++-------------+
+| self_verify |
++-------------+
+```
+
+###### Deploy New Account
+
+```
++--------+-------------+
+| deploy | self_verify |
++--------+-------------+
+```
+
+##### Canonical Paymaster
+
+###### Basic Transaction
+
+```
++-------------+-----+
+| only_verify | pay |
++-------------+-----+
+```
+
+###### Deploy New Account
+
+```
++--------+-------------+-----+
+| deploy | only_verify | pay |
++--------+-------------+-----+
+```
+
+Frames after these prefixes are outside public mempool validation. For example, a transaction may continue with any number of `user_op`s and/or `post_op`s.
+
+#### Structural Rules
+
+To be accepted into the public mempool, a frame transaction must satisfy the following:
+
+1. Its validation prefix must match one of the four recognized prefixes above.
+2. If present, `deploy` must be the first frame. This implies there can be at most one `deploy` frame in the validation prefix.
+3. `self_verify` and `only_verify` must be validation frames, target `tx.sender` (either explicitly or via a null target), and must successfully call `APPROVE`.
+    - `self_verify` must call `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)`.
+    - `only_verify` must call `APPROVE(APPROVE_EXECUTION)`.
+4. `pay` must be a validation frame and successfully call `APPROVE(APPROVE_PAYMENT)`.
+5. No frame in the validation prefix may have the `ATOMIC_BATCH` modifier set.
+6. The sum of `gas_limit` values across the validation prefix, plus the intrinsic cost of validating `tx.signatures`, must not exceed `MAX_VERIFY_GAS`.
+7. Nodes should stop simulation immediately once `payer` has been set.
+
+#### Expiry Frame
+
+The canonical expiry [recognized frame template](#recognized-frame-templates). An `expiry_verify` frame MAY appear at any position in the frame list. For the purposes of matching the recognized validation-prefix shapes above, expiry frames are skipped (e.g., `[expiry_verify, self_verify]` is recognized as `[self_verify]`).
+
+A node MUST drop a frame transaction from the public mempool if it contains an `expiry_verify` frame whose deadline is less than the node's view of the current block timestamp at any point.
+
+Expiry frames are not subject to the validation trace rules, storage-dependency tracking, or `MAX_VERIFY_GAS`. The `TIMESTAMP` opcode is permitted only inside a frame whose `resolved_target` runtime code equals `CANONICAL_EXPIRY_CODE`; clients may optimize the frame by performing the same deadline check without explicit EVM execution.
+
+#### Canonical Paymaster Exception
+
+The canonical paymaster [recognized frame template](#recognized-frame-templates). The generic validation trace and opcode rules below apply to all frames in the validation prefix except a `pay` frame whose target runtime code exactly matches the canonical paymaster implementation. That implementation is explicitly designed to be safe for public mempool use and is therefore admitted by code match, successful `APPROVE(APPROVE_PAYMENT)`, and the paymaster accounting rules in this section, rather than by requiring it to satisfy each generic validation rule individually.
+
+#### Validation Trace Rules
+
+A public mempool node must simulate the validation prefix and reject the transaction if any of the following occurs before `payer` has been set:
+
+- a frame in the validation prefix reverts
+- a `self_verify`, `only_verify`, or `pay` frame exits without its required `APPROVE`
+- total public-mempool validation work, including signature validation, exceeds `MAX_VERIFY_GAS`
+- execution uses a banned opcode
+- execution performs a state write outside the permitted set. The permitted writes are: (a) `SSTORE` to `tx.sender`'s own storage during a `VERIFY` frame whose `resolved_target` is `tx.sender`, as an [approval effect](#approval-effects); and (b) inside the first `deploy` frame, `CREATE`, `CREATE2`, or `SETDELEGATE` operations that install code at `tx.sender`, and `SSTORE`s to `tx.sender`'s storage
+- execution reads storage outside `tx.sender`
+- execution performs `CALL*` or `EXTCODE*` to an address that is neither an existing contract nor a precompile, or to an address that uses an EIP-7702 delegation, except for `tx.sender` default-code behavior
+- if a `deploy` frame is present, its execution does not result in non-empty code being installed at `tx.sender` (either conventional contract code or an EIP-7702 delegation indicator)
+
+##### Banned Opcodes
+
+For `VERIFY` frames, the usual `STATICCALL` restrictions apply except for the protocol-defined [approval effects](#approval-effects) (`APPROVE` and own-storage `SSTORE`). In addition, the following opcodes are banned during the validation prefix, with a few caveats:
+
+- ORIGIN (0x32)
+- GASPRICE (0x3A)
+- BLOCKHASH (0x40)
+- COINBASE (0x41)
+- TIMESTAMP (0x42)
+    - Except inside an expiry frame (`resolved_target` runtime code equals `CANONICAL_EXPIRY_CODE`).
+- NUMBER (0x43)
+- PREVRANDAO/DIFFICULTY (0x44)
+- GASLIMIT (0x45)
+- BASEFEE (0x48)
+- BLOBHASH (0x49)
+- BLOBBASEFEE (0x4A)
+- GAS (0x5A)
+    - Except when followed immediately by a `*CALL` instruction. This is the standard method of passing gas to a child call and does not create an additional public mempool dependency.
+- CREATE (0xF0)
+    - Except inside the first `deploy` frame.
+- CREATE2 (0xF5)
+    - Except inside the first `deploy` frame.
+- SETDELEGATE (0xF6, [EIP-7819](./eip-7819.md))
+    - Except inside the first `deploy` frame.
+- INVALID (0xFE)
+- SELFDESTRUCT (0xFF)
+- BALANCE (0x31)
+- SELFBALANCE (0x47)
+- SSTORE (0x55)
+    - Except to `resolved_target`'s own storage in a `VERIFY` frame (an [approval effect](#approval-effects)), or inside the first `deploy` frame to `tx.sender`'s storage.
+- TLOAD (0x5C)
+- TSTORE (0x5D)
+
+`SLOAD` can be used only to access `tx.sender` storage, including when reached transitively via `CALL*` or `DELEGATECALL`.
+
+`CALL*` and `EXTCODE*` may target any existing contract or precompile, provided the resulting trace still satisfies the storage, opcode, and EIP-7702 restrictions above. This permits helper contracts and libraries during validation, including via `DELEGATECALL`, so long as they do not introduce additional mutable-state dependencies.
+
+#### Paymasters
+
+A paymaster can choose to sponsor a transaction's gas. Generally the relationship is one paymaster to many transaction senders, however, this is in direct conflict with the goal of not predicating the validity of many transactions on the value of one account or storage element.
+
+We address this conflict in two ways:
+
+1. If a paymaster sponsors gas for a large number of accounts simultaneously, it must be a safe, standardized paymaster contract. It is designed such that ether which enters it cannot leave except:
+  a. in the form of payment for a transaction, or
+  b. after a delay period.
+2. If a paymaster sponsors gas for a small number of accounts simultaneously (no more than `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER`), it may be any paymaster contract.
+
+##### Canonical paymaster
+
+The canonical paymaster is not a singleton deployment. Many instances may be deployed. For public mempool purposes, a paymaster instance is considered canonical if and only if the runtime code at the `pay` frame target exactly matches the canonical paymaster implementation.
+
+The canonical paymaster in this draft authorizes with a single secp256k1 signer via `ecrecover`, does not support contract-signature schemes, and may change in later specifications, in which case a new canonical implementation version would be required.
+
+Because the canonical paymaster implementation is explicitly standardized to be safe for public mempool use, nodes do not need to apply the generic validation trace and opcode rules to that `pay` frame. Instead, they identify it by runtime code match and apply the paymaster-specific accounting and revalidation rules in this section.
+
+A transaction using a paymaster is eligible for public mempool propagation only if the `pay` frame targets a canonical paymaster instance and the node can reserve the maximum transaction cost against that paymaster.
+
+For public mempool purposes, each node maintains a local accounting value `reserved_pending_cost(paymaster)` and computes:
+
+```python
+available_paymaster_balance = state.balance(paymaster) - reserved_pending_cost(paymaster) - pending_withdrawal_amount(paymaster)
+```
+
+Where `pending_withdrawal_amount(paymaster)` is the currently pending delayed withdrawal amount of the canonical paymaster instance, or zero if no delayed withdrawal is pending.
+
+A node must reject a paymaster transaction if `available_paymaster_balance` is less than the transaction's maximum cost (`TXPARAM(0x06)`).
+
+On admission, the node increments `reserved_pending_cost(paymaster)` by the transaction's maximum cost (`TXPARAM(0x06)`). On eviction, replacement, inclusion, or reorg removal, the node decrements it accordingly.
+
+##### Non-canonical paymaster
+
+For non-canonical paymasters, `pending_withdrawal_amount` is not meaningful since they may not support timelocked withdrawals.  Instead, we keep the mempool safe by enforcing that each non-canonical paymaster can only be used with no more than `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER` pending transactions.
+
+Therefore we perform two checks:
+
+- For balance, `available_paymaster_balance` must not be less than the transaction cost, where:
+
+```python
+available_paymaster_balance = state.balance(paymaster) - reserved_pending_cost(paymaster)
+```
+
+- The number of pending transactions in the mempool that uses this paymaster must be less than `MAX_PENDING_TXS_USING_NON_CANONICAL_PAYMASTER`.
+
+[See here for rationale](#non-canonical-paymasters-in-the-mempool) for enabling non-canonical paymasters in the mempool.
+
+#### Acceptance Algorithm
+
+1. A transaction is received over the wire and the node decides whether to accept or reject it.
+2. The node validates all signatures. If any signature is malformed or invalid, reject.
+3. The node analyzes the frame structure and determines the validation prefix. If the prefix is not one of the recognized prefixes, reject.
+4. The node simulates the validation prefix and enforces the structural and trace rules above, except that a `pay` frame whose target runtime code exactly matches the canonical paymaster implementation is handled via the canonical paymaster exception and the paymaster-specific rules below.
+5. The node records the sender storage slots read or written during validation. Calls into helper contracts do not create additional mutable-state dependencies unless they cause disallowed storage access under the trace rules above.
+6. If a canonical paymaster instance is used, the node verifies paymaster solvency using the reservation rule above.
+7. A node should keep at most one pending frame transaction per sender in the public mempool. A new transaction from the same sender MAY replace the existing one only if it uses the same nonce and satisfies the node's fee bump rules.
+8. If all checks pass, the transaction may be accepted into the public mempool and propagated to peers.
+
+#### Revalidation
+
+When a new canonical block is accepted, the node removes any included frame transactions from the public mempool, updates paymaster reservations accordingly, and identifies the remaining pending transactions whose tracked dependencies were touched by the block. This includes at least transactions for the same sender, transactions whose recorded sender storage slots (read or written during validation) changed, and transactions that reference a canonical paymaster instance whose balance, code, or delayed-withdrawal state changed. The node then re-simulates the validation prefix of only those affected transactions against the new head and evicts any transaction that no longer satisfies the public mempool rules.
+
+#### Transaction origination
+
+Do not apply the restriction put in place by [EIP-3607](./eip-3607.md) to frame transactions.
+Specifically, `SENDER` frames originate calls where `tx.sender` is a contract account.
+Validation logic for other transaction types remains unchanged, i.e. the transaction is only valid if the sender account's code is either empty or a valid delegation indicator.
+
+## Rationale
+
+### Strict-by-default mempool with recognized frame templates
+
+Several features in this specification — expiry, the canonical paymaster, and the built-in default-code behavior — are not consensus mechanisms. At consensus level each is an ordinary frame: a call to a contract (or, for default code, the protocol's built-in behavior for empty-code accounts). What makes them feel "special" is purely the public mempool: the mempool is strict by default (no environment reads, no third-party state, no out-of-`tx.sender` writes during the validation prefix) and *relaxes* those restrictions for code it recognizes.
+
+Modelling this as a single [Recognized Frame Templates](#recognized-frame-templates) mechanism, rather than as a separate hardcoded rule per feature, has three benefits:
+
+- **Expiry needs no consensus surface.** It is just a `VERIFY` frame calling a contract whose code the mempool recognizes; `TIMESTAMP` is permitted by relaxing a mempool rule, not by a consensus exception (a `STATICCALL`-restricted frame already permits reads). This removes the `EXPIRY_VERIFIER` predeploy, the `EXPIRY_DATA_LENGTH` constant, and the per-frame validity asserts.
+- **New features relax the mempool without touching consensus.** Recognizing a new smart-account verifier template, a new paymaster version, or a guarantor-backed admission path is a versioned mempool-policy change. Consensus execution is unchanged. This is the "start strict, relax for known frames" model.
+- **One vocabulary.** Default code, canonical paymaster, and canonical expiry are described uniformly as templates with declared relaxations, instead of three independently-specified exceptions.
+
+### Approval effects: one rule for non-revertible validation-time writes
+
+v1 described `APPROVE`'s effect on `payer`/`sender_approved`, the deploy-frame storage carve-out, and the atomic-batch rollback boundary in separate places, and forbade all `SSTORE` during `VERIFY` except inside the deploy frame — stricter than [ERC-7562](./eip-7562.md) `[STO-010]`, the rule ERC-4337 validators have used since 2024, with no written rationale. This specification states one rule: an [approval effect](#approval-effects) is either an `APPROVE` flag update or an own-storage `SSTORE` in a successfully-exiting `VERIFY` frame, and approval effects survive later-frame reverts and atomic-batch rollback. This removes the asymmetric carve-out and gives downstream features (multi-dimensional nonces, nullifier sets) a single, naturally-priced primitive — though the public mempool still admits such writes only for recognized templates, so DoS-safety is preserved.
+
+### Frame `kind` and `modifiers`: merge what is correlated, separate what is orthogonal
+
+v1 carried a `mode` field (caller identity + side-effect class) and an approval-scope flag separately, even though an approval scope is only meaningful for a validation frame. This specification merges the two correlated properties into a single `kind` enum and keeps the genuinely orthogonal property — atomicity, and any future per-frame lifecycle marker — in a separate `modifiers` field. The guiding rule is: **merge fields that are correlated, keep fields that are orthogonal separate.** Merging correlated fields removes impossible combinations (a scope on a non-validation frame); keeping orthogonal fields separate avoids multiplying the enum (a `kind` per (caller × class × atomicity × lifecycle) combination).
+
+The caller-identity and side-effect-class axes form a 2×2 space with one meaningless cell (validate-as-sender), so the three execution-relevant `kind` families (`DEFAULT`, `SENDER`, `VERIFY*`) are already a near-minimal encoding of the useful subset; decomposing them back into separate fields would only re-introduce the dead cell. This is why purpose and lifecycle (commit/reveal, deploy, post-op) are expressed through `modifiers` and the mempool's [recognized templates](#recognized-frame-templates), **not** by adding new `kind` values — keeping the consensus kind set from accreting.
+
+### Execution authorization is symmetric with payment authorization
+
+A `SENDER` frame is not a privileged special case; it is "execute as the account principal `tx.sender`", subject to one general rule: *a frame whose caller is an account principal `P` may run only if `P` produced an execution-approval effect.* This mirrors payment exactly — `APPROVE(PAYMENT)` authorizes gas payment, `APPROVE(EXECUTION)` authorizes execution-as-that-principal — so both are uniform [approval effects](#approval-effects) that gate a capability, rather than execution being a bespoke mode with a hardwired `sender_approved` precondition. Because the envelope names a single `sender`, the rule degenerates today to the single boolean `sender_approved`; it generalizes without further consensus change to designs that authorize execution for more than one principal.
+
+### Canonical signature hash
+
+The canonical signature hash is provided in `TXPARAM` to simplify the development of smart accounts.
+
+Computing the signature hash in EVM is complicated and expensive. While using the canonical signature hash is not mandatory, it is strongly recommended. Creating a bespoke signature requires precise commitment to the underlying transaction data. Without this, it's possible that some elements can be manipulated in-the-air while the transaction is pending and have unexpected effects. This is known as transaction malleability. Using the canonical signature hash avoids malleability of the frames.
+
+The raw `signature` bytes of signatures with empty `msg` are elided from the canonical signature hash. This is done for three reasons:
+
+1. A signature over `compute_sig_hash(tx)` cannot commit to its own raw bytes.
+2. In the future it may be desired to aggregate or otherwise externalize these signatures for data and compute efficiency reasons.
+3. Signatures with explicit 32-byte `msg` values do not induce this circularity, so their raw bytes are currently committed by the transaction signature hash.
+
+The `data` of `VERIFY` frames, including expiry frame deadlines, is not elided. Any validation data that is intended to be added after a sender signs should be represented as elided raw signature bytes in `tx.signatures`, rather than as mutable frame data.
+
+### `APPROVE` calling convention
+
+Originally `APPROVE` was meant to extend the space of return statuses from 0 and 1 today to 0 to 4. However, this would mean smart accounts deployed today would not be able to modify their contract code to return with a different value at the top level. For this reason, we've chosen behavior above: `APPROVE` terminates the executing frame successfully like `RETURN`, but it actually updates the transaction scoped values `sender_approved` and `payer` during execution. It is still required that only the sender can toggle the `sender_approved` to `true`. Only the frame's resolved target can call `APPROVE` generally, because it can allow the transaction pool and other frames to better reason about validation frames.
+
+Because `DELEGATECALL` preserves `ADDRESS`, code executed via `DELEGATECALL` from the resolved target may also execute `APPROVE` successfully. Contracts that rely on `APPROVE` should therefore treat delegatecalled libraries as fully trusted.
+
+### Payer in receipt
+
+The payer cannot be determined statically from a frame transaction and is relevant to users. The only way to provide this information safely and efficiently over the JSON-RPC is to record this data in the receipt object.
+
+### No authorization list
+
+The EIP-7702 authorization list heavily relies on ECDSA cryptography to determine the authority of accounts to delegate code. While delegations could be used in other manners later, it does not satisfy the PQ goals of the frame transaction.
+
+### No access list
+
+The access list was introduced to address a particular backwards compatibility issue that was caused by EIP-2929. The risk-reward of using an access list successfully is high. A single miss, paying to warm a storage slot that does not end up getting used, causes the overall transaction cost to be greater than had it not been included at all.
+
+Future optimizations based on pre-announcing state elements a transaction will touch will be covered by block level access lists.
+
+### Atomic batching
+
+Atomic batching allows multiple frames to be grouped into a single all-or-nothing unit. This is useful when a sequence of calls is only meaningful if all succeed together, such as an approval followed by a swap, or a series of interdependent state changes. Without this feature, a revert in one frame would leave the preceding frames' state changes applied, potentially leaving the account in an undesirable intermediate state.
+
+Using an orthogonal `modifiers` bit to indicate atomic batches saves us from having to introduce a new `kind`. Because atomicity is independent of caller identity and side-effect class, it must not be folded into `kind` (which would double the kind space); it is exactly the sort of orthogonal, per-frame property the `modifiers` field exists to carry. Batches are identified purely by consecutive frames with the bit set, terminated by a frame without it, which also enables consecutive atomic batches.
+
+### Per-frame cost
+
+Each frame incurs a fixed CALL execution-context overhead (100) plus `G_log` (375) for the receipt sub-entry it produces, giving `FRAME_TX_PER_FRAME_COST = 475`. The execution-context component covers context setup, kind dispatch, and gas accounting at the frame boundary, analogous to the fixed overhead of a CALL. The `G_log` component covers the `[status, gas_used, logs]` receipt sub-entry that each frame adds to the transaction receipt, which must be serialized, hashed into the receipt trie, and proven by ZK-EVM implementations. Cold/warm access costs for the frame's target account are charged within the frame's own `gas_limit` through the normal EVM warm/cold accounting, not through the per-frame cost.
+
+### Per-frame value
+
+A design goal of the frame transaction is to provide a good experience out-of-the-box for users and to reduce the threat surface of smart contract wallets. Like batching, sending native value is a part of achieving that.
+
+Restricting non-zero `value` to `SENDER` frames keeps `VERIFY` and `DEFAULT` frames side-effect-free with respect to ETH transfer semantics, preserves the intended `STATICCALL`-like behavior of `VERIFY`, and avoids requiring the protocol-defined `ENTRY_POINT` caller to fund top-level ETH transfers.
+
+### Public Key Aliases
+
+Future signature schemes with large public keys may benefit from a state-backed alias mechanism. Such an alias could be a 20-byte address that identifies a public key stored in state, allowing transactions to reference the address instead of carrying the full public key each time.
+
+A future extension could represent the alias account as non-executable code containing a canonical public key object, for example:
+
+```text
+0xef02 || version || key_type || pubkey_len || pubkey
+```
+
+where `key_type` defines the cryptosystem, public key encoding, valid lengths, and validation rules for `pubkey`.
+
+That extension could also define a `PUBLISHPK` instruction to validate a public key, wrap it in the canonical alias-code format, derive the alias address, and install the alias code.
+
+### Externally Owned Account (EOA) support
+
+While we expect EOA users to migrate to smart accounts eventually, we recognize that most Ethereum users today are using EOAs, so we want to improve UX for them where we can.
+
+Thanks to the default code, EOAs today can use frame transactions to reap many benefits of account abstraction, including sending sponsored transactions, paying gas in ERC-20 tokens, batch transactions, and more.
+
+### Non-canonical paymasters in the mempool
+
+The primary use case for non-canonical paymasters is to enable users to pay gas with a dedicated "gas account," so that their other accounts can transact without holding any ETH. For example, a user might have a single account that holds some ETH, while other accounts only hold stablecoins and NFTs, and they can transact freely with these other accounts while using the gas account as the paymaster.
+
+Note that users can use any EOA as a paymaster thanks to the [default code](#default-code).
+
+### Examples
+
+#### Example 1: Simple Transaction
+
+| Frame | Caller      | Target        | Value | Kind                       | Modifiers | Data      |
+| ----- | ----------- | ------------- | ----- | -------------------------- | --------- | --------- |
+| 0     | ENTRY_POINT | Null (sender) | 0     | `VERIFY_PAYMENT_EXECUTION` | —         | Empty     |
+| 1     | Sender      | Target        | 0     | `SENDER`                   | —         | Call data |
+
+Frame 0 uses a signature entry with empty `msg` for the sender and calls `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)` to approve both payment and execution. Frame 1 executes and exits normally via `RETURN`.
+
+The mempool can process this transaction with the following static validation and call:
+
+- Verify that the first frame is a validation frame.
+- Verify that the call of frame 0 succeeds, and does not violate the mempool rules (similar to [ERC-7562](./eip-7562.md)).
+
+#### Example 1a: Simple ETH transfer
+
+| Frame | Caller      | Target        | Value  | Kind                       | Modifiers | Data  |
+| ----- | ----------- | ------------- | ------ | -------------------------- | --------- | ----- |
+| 0     | ENTRY_POINT | Null (sender) | 0      | `VERIFY_PAYMENT_EXECUTION` | —         | Empty |
+| 1     | Sender      | Destination   | Amount | `SENDER`                   | —         | Empty |
+
+A simple transfer is performed by setting the `SENDER` frame target to the destination account and the frame `value` to the transfer amount. This requires two frames for mempool compatibility, since the validation phase of the transaction has to be static.
+
+#### Example 1b: Simple account deployment
+
+| Frame | Caller      | Target        | Value  | Kind                       | Modifiers | Data           |
+| ----- | ----------- | ------------- | ------ | -------------------------- | --------- | -------------- |
+| 0     | ENTRY_POINT | Deployer      | 0      | `DEFAULT`                  | —         | Initcode, Salt |
+| 1     | ENTRY_POINT | Null (sender) | 0      | `VERIFY_PAYMENT_EXECUTION` | —         | Empty          |
+| 2     | Sender      | Destination   | Amount | `SENDER`                   | —         | Empty          |
+
+This example illustrates the initial deployment flow for a smart account at the `sender` address. Since the address needs to have code in order to validate the transaction, the transaction must deploy the code before verification.
+
+The first frame would call the [EIP-7997](./eip-7997.md) deterministic factory predeploy. The deployer determines the address in a deterministic way from the salt and initcode. However, since the transaction sender is not authenticated at this point, the user must choose an initcode which is safe to deploy by anyone.
+
+#### Example 2: Atomic Approve + Swap
+
+| Frame | Caller      | Target        | Value | Kind                       | Modifiers      | Data                 |
+| ----- | ----------- | ------------- | ----- | -------------------------- | -------------- | -------------------- |
+| 0     | ENTRY_POINT | Null (sender) | 0     | `VERIFY_PAYMENT_EXECUTION` | —              | Empty                |
+| 1     | Sender      | ERC-20        | 0     | `SENDER`                   | `ATOMIC_BATCH` | approve(DEX, amount) |
+| 2     | Sender      | DEX           | 0     | `SENDER`                   | —              | swap(...)            |
+
+Frame 0 uses a signature entry with empty `msg` and calls `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)`. Frames 1 and 2 form an atomic batch: if the swap in frame 2 reverts, the ERC-20 approval from frame 1 is also reverted, preventing the account from being left with a dangling approval.
+
+#### Example 3: Sponsored Transaction (Fee Payment in ERC-20)
+
+| Frame | Caller      | Target        | Value | Kind               | Modifiers | Data                   |
+| ----- | ----------- | ------------- | ----- | ------------------ | --------- | ---------------------- |
+| 0     | ENTRY_POINT | Null (sender) | 0     | `VERIFY_EXECUTION` | —         | Empty                  |
+| 1     | ENTRY_POINT | Sponsor       | 0     | `VERIFY_PAYMENT`   | —         | Sponsor data           |
+| 2     | Sender      | ERC-20        | 0     | `SENDER`           | —         | transfer(Sponsor,fees) |
+| 3     | Sender      | Target addr   | 0     | `SENDER`           | —         | Call data              |
+| 4     | ENTRY_POINT | Sponsor       | 0     | `DEFAULT`          | —         | Post op call           |
+
+- Frame 0: Uses the sender's signature entry with empty `msg` and calls `APPROVE(APPROVE_EXECUTION)` to authorize execution from sender.
+- Frame 1: Checks that the user has enough ERC-20 tokens, inspects signature metadata in `tx.signatures` if needed, and checks that the next frame is an ERC-20 send of the right size to the sponsor. Calls `APPROVE(APPROVE_PAYMENT)` to authorize payment.
+- Frame 2: Sends tokens to sponsor.
+- Frame 3: User's intended call.
+- Frame 4 (optional): Check unpaid gas, refund tokens, possibly convert tokens to ETH on an AMM.
+
+### Data Efficiency
+
+**Basic transaction sending ETH from a smart account:**
+
+| Field                             | Bytes |
+| --------------------------------- | ----- |
+| Tx wrapper                        | 1     |
+| Chain ID                          | 1     |
+| Nonce                             | 2     |
+| Sender                            | 20    |
+| Max priority fee                  | 5     |
+| Max fee                           | 5     |
+| Max fee per blob gas              | 1     |
+| Blob versioned hashes (empty)     | 1     |
+| Signatures wrapper                | 1     |
+| Sender tx signature: scheme       | 1     |
+| Sender tx signature: signer       | 20    |
+| Sender tx signature: msg          | 0     |
+| Sender tx signature: signature    | 65    |
+| Frames wrapper                    | 1     |
+| Sender validation frame: kind     | 1     |
+| Sender validation frame: modifiers    | 1     |
+| Sender validation frame: target   | 1     |
+| Sender validation frame: gas      | 2     |
+| Sender validation frame: value    | 1     |
+| Sender validation frame: data     | 0     |
+| Execution frame: kind             | 1     |
+| Execution frame: modifiers            | 1     |
+| Execution frame: target           | 20    |
+| Execution frame: gas              | 1     |
+| Execution frame: value            | 5     |
+| Execution frame: data             | 0     |
+| **Total**                         | 158   |
+
+Notes: Nonce assumes < 65536 prior sends. Fees assume < 1099 gwei. Validation frame target is 1 byte because target is `tx.sender`. Validation gas assumes <= 65,536 gas. Validation frame value is zero. Execution frame target is encoded directly as the destination address. Execution frame value assumes a compact 5-byte encoding. The execution frame data is empty for a plain ETH transfer. The signature is a secp256k1 entry with empty `msg` using a 65-byte ECDSA signature. Blob fields assume no blobs (empty list, zero max fee).
+
+This is not much larger than an EIP-1559 transaction; the extra overhead is mainly the need to specify the sender and the per-frame wrapper explicitly.
+
+**First transaction from an account (add deployment frame):**
+
+| Field                      | Bytes |
+| -------------------------- | ----- |
+| Deployment frame: kind     | 1     |
+| Deployment frame: modifiers    | 1     |
+| Deployment frame: target   | 20    |
+| Deployment frame: gas      | 3     |
+| Deployment frame: value    | 1     |
+| Deployment frame: data     | 100   |
+| **Total additional**       | 126   |
+
+Notes: Gas assumes cost < 2^24. Calldata assumes small proxy.
+
+**Trustless pay-with-ERC-20 sponsor (add these frames):**
+
+| Field                                | Bytes |
+| ------------------------------------ | ----- |
+| Sponsor validation frame: kind       | 1     |
+| Sponsor validation frame: modifiers      | 1     |
+| Sponsor validation frame: target     | 20    |
+| Sponsor validation frame: gas        | 3     |
+| Sponsor validation frame: value      | 1     |
+| Sponsor validation frame: calldata   | 0     |
+| Send to sponsor frame: kind          | 1     |
+| Send to sponsor frame: modifiers         | 1     |
+| Send to sponsor frame: target        | 20    |
+| Send to sponsor frame: gas           | 3     |
+| Send to sponsor frame: value         | 1     |
+| Send to sponsor frame: calldata      | 68    |
+| Sponsor post op frame: kind          | 2     |
+| Sponsor post op frame: modifiers         | 1     |
+| Sponsor post op frame: target        | 20    |
+| Sponsor post op frame: gas           | 3     |
+| Sponsor post op frame: value         | 1     |
+| Sponsor post op frame: calldata      | 0     |
+| **Total additional**                 | 147   |
+
+Notes: Sponsor can read info from other fields. ERC-20 transfer call is 68 bytes.
+
+There is some inefficiency in the sponsor case, because the same sponsor address must appear in three places (sponsor validation, send to sponsor inside ERC-20 calldata, post op frame), and the ABI is inefficient (~12 + 24 bytes wasted on zeroes). This is difficult to mitigate in a "clean" way, because one of the duplicates is inside the ERC-20 call, "opaque" to the protocol. However, it is much less inefficient than ERC-4337, because not all of the data takes the hit of the 32-byte-per-field ABI overhead.
+
+
+## Backwards Compatibility
+
+The `ORIGIN` opcode behavior changes for frame transactions, returning the frame's caller rather than the traditional transaction origin. This is consistent with the precedent set by EIP-7702, which already modified `ORIGIN` semantics. Contracts that rely on `ORIGIN = CALLER` for security checks (a discouraged pattern) may behave differently under frame transactions.
+
+## Security Considerations
+
+### Transaction Propagation
+
+Frame transactions introduce new denial-of-service vectors for transaction pools that node operators must mitigate. Because validation logic is arbitrary EVM code, attackers can craft transactions that appear valid during initial validation but become invalid later. Without any additional policies, an attacker could submit many transactions whose validity depends on some shared state, then submit one transaction that modifies that state, and cause all other transactions to become invalid simultaneously. This wastes the computational resources nodes spent validating and storing these transactions.
+
+#### Example Attack
+
+A simple example is transactions that check `block.timestamp`:
+
+```solidity
+function validateTransaction() external {
+    require(block.timestamp < SOME_DEADLINE, "expired");
+    // ... rest of validation
+    APPROVE(APPROVE_EXECUTION_AND_PAYMENT);
+}
+```
+
+Such transactions are valid when submitted but become invalid once the deadline passes, without any on-chain action required from the attacker.
+
+#### Validation-time storage writes
+
+Permitting own-storage `SSTORE` during a `VERIFY` frame (an [approval effect](#approval-effects)) does not weaken mempool DoS protection. The written slots belong to `tx.sender`, are tracked as revalidation dependencies identically to reads, count against `MAX_VERIFY_GAS`, and are admitted by the public mempool only for [recognized frame templates](#recognized-frame-templates). This is the ERC-7562 `[STO-010]` model under which ERC-4337 has operated since 2024. It does place more trust in the verifier contract being correct; the strict-by-default template-recognition gate is what bounds that trust for public propagation, while builders accepting unrecognized verifiers via private channels accept the corresponding risk.
+
+#### Deploy Frame Front-Running
+
+If a transaction uses a `deploy` frame, that frame executes before the sender is authenticated. An observer can front-run the same deterministic deployment and cause the `deploy` frame to fail because code is already present at `tx.sender`. Accordingly, the deploy frame's calldata (and any initcode it carries) must be safe to submit by any party, and wallets should expect resubmission without the `deploy` frame once deployment has already occurred.
+
+#### Explicit Sender State-Read Amplification
+
+Because `tx.sender` is explicit in the transaction envelope, an attacker can submit many invalid frame transactions that name arbitrary sender addresses and force nodes to read sender state, including the nonce check required before execution. Public mempool implementations should therefore perform all available structural and stateless checks before sender-state access and should consider peer-level rate limiting or other DoS mitigations for repeated invalid transactions that vary `tx.sender`.
+
+#### Cross-frame Data Visibility During Validation
+
+`FRAMEPARAM`, `FRAMEDATALOAD`, and `FRAMEDATACOPY` allow validation code to inspect other frames, including later `SENDER` frames and their `value`s. As a result, paymasters and other `VERIFY` frames can observe user operation parameters before approval and may condition their behavior on that information. Users should therefore treat non-`VERIFY` frame parameters and data as visible to validation logic and should not rely on untrusted paymasters or verifiers to keep such information private.
+
+##### Mitigations
+
+Node implementations should consider restricting which opcodes and storage slots validation frames can access, similar to ERC-7562. This isolates transactions from each other and limits mass invalidation vectors.
+
+It's recommended that to *validate* the transaction, a specific frame structure is enforced and the amount of gas that is expended executing the validation phase must be limited. Once the validation prefix reaches payer approval via `APPROVE(APPROVE_PAYMENT)` or `APPROVE(APPROVE_EXECUTION_AND_PAYMENT)`, the transaction can be included in the mempool and propagated to peers safely.
+
+For deployment of the sender account in the first frame, the mempool enforces deploy-frame determinism via the validation trace rules. Any contract may be used as `frame.target`, provided the frame's execution satisfies those rules — notably, it must not read mutable state outside `tx.sender` or maintain per-deploy factory storage (counters, reentrancy flags, etc.), so that the deployment result is independent of chain state. Factories deployed via the [EIP-7997](./eip-7997.md) deterministic factory predeploy are the canonical choice for acquiring a cross-chain-stable factory address.
+
+In general, it can be assumed that handling of frame transactions imposes similar restrictions as EIP-7702 on mempool relay, i.e. only a single transaction can be pending for an account that uses frame transactions.
+
+## Copyright
+
+Copyright and related rights waived via [CC0](../LICENSE.md).
