@@ -32,63 +32,87 @@ Scope — EL EIPs in [EIP-7773](https://github.com/ethereum/EIPs/blob/2e7e88bb8d
 
 ## 2. Proposed dependency tree
 
-Arrows = `requires` (must be readable/implementable first).
+The tree below shows the proposed in-fork `requires:` graph after cleanup (it is a DAG;
+an EIP appearing more than once is the same node, marked "as above"). An edge means the
+lower EIP must be readable and implementable first; the upper EIP is a diff against it.
+Pre-fork dependencies (7623, 2930, 7702, 7825, 1014, …) are omitted except where they
+explain an edge.
 
 ```text
-Layer 0 — self-contained semantics
-  7610  creation-collision rule                (amends 684)
-  7843  SLOTNUM + slotNumber header field
-  7954  code/initcode size limits              (amends 170/3860)
+Legend:  ──▶  hard `requires` edge (read/implement the target first)
+         ─✳   value-only symbol binding, NOT a `requires` edge: the lower EIP
+              charges a named gas-schedule symbol; 8037 (re)defines that
+              symbol's value and gas dimension. This is what breaks the
+              2780 ⇄ 8037 cycle.
+
+8037  state-gas dimension: CPSB, reservoir, 2-D block accounting (integrator)
+ ├──▶ 2780  intrinsic/runtime split, pre-execution phase
+ │     ├──▶ 8038  regular-gas state-access schedule (COLD_ACCOUNT_ACCESS, …)
+ │     ├──▶ 7976  calldata floor 64/64
+ │     ├──▶ 7708  transfer logs (log shape priced as TRANSFER_LOG_COST)
+ │     │     └──▶ 8246  SELFDESTRUCT burn removal
+ │     │           └──▶ 7928  (records surviving balance-only accounts in BAL)
+ │     ├──▶ 7928  block-level access lists (sender/recipient inclusion timing)
+ │     └─✳  GAS_NEW_ACCOUNT, PER_AUTH_BASE_COST (state component)
+ │          value := STATE_BYTES_* × CPSB, dimension := state gas,
+ │          both defined by 8037's existing "Parameter changes" table
+ ├──▶ 8038  (as above)
+ ├──▶ 7981  access-list data surcharge
+ │     └──▶ 7976  (as above)
+ ├──▶ 7778  block accounting without refunds
+ │     └──▶ 7976  (floor term, as above)
+ └──▶ 7928  (as above: CREATE/CALL access timing; BAL gas-dimension note)
+
+No in-fork requires (self-contained):
+  7610  creation-collision rule (amends 684)
+  7843  SLOTNUM  (engine-API/header coordination with 7928 via execution-apis)
+  7954  code/initcode size limits  (informative note on 8037 code-deposit bound)
+  7997  factory predeploy → 1014  (informative notes on 7610 and 8037)
   8024  DUPN/SWAPN/EXCHANGE
   8163  reserve EXTENSION 0xae
-  8246  SELFDESTRUCT burn removal              (amends 161/6780)
-  7904  Informational (no changes) — must appear in NO requires chain
-
-Layer 1 — data & accounting primitives
-  7976  calldata floor 64/64                   → 7623
-  7981  access-list data surcharge             → 7976, 2930
-  7778  block accounting w/o refunds           → 7976 (floor term)
-  7708  transfer logs                          → 8246
-  7928  BALs, access timing, two-phase gas
-        validation framework                   (standalone; parametric in gas values)
-  7997  factory predeploy                      → 1014 (+ 7610 collision note)
-
-Layer 2 — regular-gas repricing
-  8038  state-access schedule                  → (Layer 0/1 only)
-        [drop `requires: 8037, 7904`]
-
-Layer 3 — transaction structure
-  2780  intrinsic/runtime split,
-        pre-execution phase                    → 8038, 7976, 7708, 7928, 7702
-        [drop `requires: 8037`]
-
-Layer 4 — integrator
-  8037  state-gas dimension, CPSB, reservoir,
-        two-dimensional block accounting       → 2780, 8038, 7976, 7981, 7778,
-                                                 7928, 7825, 7623, 7702, 6780
-        [drop `requires: 7904`]
+  7979  CALLSUB/ENTERSUB/RETURNSUB  (validator must track the fork's opcode set)
+  7904  Informational, no changes — must appear in NO requires chain
 ```
 
-### Why the 2780 ⇄ 8037 cycle breaks with 2780 *below*
+Cycle check: all edges point downward in the listing order 7976/7928/8038/… → 7708/7981/7778
+→ 2780 → 8037; 8246 → 7928 and 7708 → 8246 introduce no back-edges. The `requires:`
+headers to change: 2780 drops 8037; 8038 drops 8037 and 7904; 8037 drops 7904 and adds
+7778.
 
-- 2780 is a **structural** change (decompose the flat 21,000; introduce the
-  pre-execution phase; move state-dependent charges to runtime). It is fully coherent in
-  a **single gas dimension**: a runtime charge is just gas charged before the first
-  frame. 2780 should charge `GAS_NEW_ACCOUNT` (25,000 under the prevailing schedule) at
-  runtime without ever mentioning state gas or `CPSB`.
-- 8037 is the **pricing-and-dimension** change. On top of 2780 it does exactly two
-  things to 2780's surface: reclassifies the runtime state-creation charges into the
-  state dimension, and re-derives their magnitudes from `CPSB`. The reservoir exists
-  only because state gas may exceed `TX_MAX_GAS_LIMIT` — a concern 2780 doesn't have.
-- The reverse ordering forces 8037 to define the state dimension against *legacy*
-  intrinsic gas (which contains state-dependent components such as
-  `PER_EMPTY_ACCOUNT_COST`), which 2780 would then delete and re-plumb — two rounds of
+### Why the 2780 ⇄ 8037 cycle breaks with 2780 *below* — via symbol indirection
+
+The goal is to untangle the circular `requires:` **without materially rewriting either
+specification**. The trick is the one the gas schedule has always used: an EIP charges a
+*named symbol* without owning its value, and a repricing EIP redefines the symbol. 2780
+must keep charging the **correct** amount when an account is created — under Glamsterdam
+that is `STATE_BYTES_PER_NEW_ACCOUNT × CPSB` (183,600), *not* a legacy fallback — it
+just stops deriving that product inline.
+
+- **2780 (below):** owns the structural change — decompose the flat 21,000, introduce
+  the pre-execution phase, move state-dependent charges to runtime. Where it currently
+  writes `STATE_BYTES_PER_NEW_ACCOUNT × CPSB` / `STATE_BYTES_PER_AUTH_BASE × CPSB` "in
+  state gas", it instead charges the pre-existing schedule symbols `GAS_NEW_ACCOUNT` and
+  `PER_AUTH_BASE_COST` (state component), whose value *and gas dimension* are whatever
+  the active schedule defines. One informative sentence covers the binding: "Under
+  [EIP-8037] these charges are `STATE_BYTES_* × CPSB`, metered in the state-gas
+  dimension." The numeric reference tables (183,600 etc.) stay as informative examples
+  under the Glamsterdam schedule. Test case 9's LIFO-refill mechanics are 8037 semantics
+  and are referenced, not restated.
+- **8037 (above):** needs almost no new text — its existing "Parameter changes" table
+  already redefines exactly these symbols (`GAS_NEW_ACCOUNT`, `PER_EMPTY_ACCOUNT_COST`,
+  `PER_AUTH_BASE_COST`) as `STATE_BYTES_* × CPSB` in the state-gas dimension. It keeps
+  owning the reservoir, LIFO refills, and the two-dimensional block accounting, and its
+  §Transaction validation section is the place where 2780's pre-execution phase is
+  *extended* (gas split into `gas_left`/`state_gas_reservoir`) rather than mutually
+  cited.
+- The reverse ordering (8037 below) would force 8037 to define the state dimension
+  against *legacy* intrinsic gas — which contains state-dependent components such as
+  `PER_EMPTY_ACCOUNT_COST` — that 2780 would then delete and re-plumb: two rounds of
   churn, and exactly the interleaved-spec situation master has today.
 
-De-circularizing concretely: 2780 drops all `CPSB`/`STATE_BYTES_*`/state-gas/LIFO-refill
-language (its runtime charges become plain gas; test case 9's refill semantics move to
-8037), and 8037's §Transaction validation / §reservoir sections become the place where
-2780's phase is *modified* rather than mutually cited.
+Net effect: charged amounts are unchanged from today's combined intent, both documents
+keep nearly all their current text, and the `requires:` arrow becomes one-directional
+(2780 no longer requires 8037; 8037 keeps requiring 2780).
 
 ### Why the 8038 ⇄ 8037 cycle breaks with 8038 *below*
 
@@ -107,7 +131,7 @@ with an informative pointer. 8038 then stands alone and could even ship without 
 | **7708** | Transfer-log shape, emission points, ordering | Should state: opcode-level logs carry no new charge; tx-level log price is 2780's `TRANSFER_LOG_COST` |
 | **7928** | BAL structure, recording/ordering, access timing, two-phase gas-validation framework | Concrete gas values (stay parametric); SELFDESTRUCT edge case needs 8246-aware rewrite (carried by 8246) |
 | **8038** | All regular-gas state-access values (`COLD_ACCOUNT_ACCESS`, `ACCOUNT_WRITE`, `STORAGE_WRITE`, `COLD_STORAGE_ACCESS`, `WARM_ACCESS`, `STORAGE_CLEAR_REFUND`, `CREATE_ACCESS`, `ACCESS_LIST_*`), SSTORE regular-gas formula, refund rules, EXT* second read | State-gas column, any 8037 reference |
-| **2780** | Intrinsic/runtime split, pre-execution phase order, `TX_BASE_COST`, `TX_VALUE_COST`, `TRANSFER_LOG_COST`, `REGULAR_PER_AUTH_BASE_COST` (move down from 8037), 7702 authorization-processing charge placement, the account **existence rule** (move down from 8037) | State-gas classification, `CPSB` products, LIFO refills |
+| **2780** | Intrinsic/runtime split, pre-execution phase order, `TX_BASE_COST`, `TX_VALUE_COST`, `TRANSFER_LOG_COST`, `REGULAR_PER_AUTH_BASE_COST` (move down from 8037), 7702 authorization-processing charge placement, the account **existence rule** (move down from 8037) | Deriving `STATE_BYTES_* × CPSB` inline — charge the schedule symbols `GAS_NEW_ACCOUNT` / `PER_AUTH_BASE_COST` instead (values + state-gas dimension defined by 8037); LIFO-refill mechanics (reference, don't restate) |
 | **8037** | `CPSB`, `STATE_BYTES_*`, state-gas dimension, reservoir + LIFO refills, per-opcode state charges, 2-D block accounting incl. per-dimension floor, receipt semantics, system-call gas, **fully-composed final formulas** | `REGULAR_PER_AUTH_BASE_COST` (→2780), existence rule (→2780), stale 7904/intrinsic text |
 | **8246** | SELFDESTRUCT finalization semantics | Should additionally carry its own BAL-recording rules (→7928) and a state-gas non-refill note (→8037) |
 | **7843** | SLOTNUM opcode, `slotNumber` header field | Engine-API version numbers (collide with 7928) |
@@ -137,7 +161,11 @@ with an informative pointer. 8038 then stands alone and could even ship without 
 **3.** **2780 ⇄ 8037** —
    [eip-2780.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L11) and
    [eip-8037.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L11) require each other.
-   Fix: 2780 below (single-dimension runtime charges); 8037 above (reclassify + reprice). See §2.
+   Fix via symbol indirection: 2780 charges the schedule symbols `GAS_NEW_ACCOUNT` /
+   `PER_AUTH_BASE_COST` — whose Glamsterdam values (`STATE_BYTES_* × CPSB`) and state-gas
+   dimension are defined by 8037's existing Parameter-changes table — and drops
+   `requires: 8037`; 8037 keeps requiring 2780. Charged amounts are unchanged
+   (183,600 for a new account), and neither spec is materially rewritten. See §2.
 
 **4.** **8037 ⇄ 8038** —
    [eip-8038.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8038.md#L11) requires 8037 back.
@@ -224,10 +252,13 @@ to the same branch or a separate PR.
 
 - **PR a (meta):** 7773 — resolve the 7979 double listing; promote or annotate the
   2780/8038/8246 status inversions (findings 1–2).
-- **PR b (de-circularization):** 2780 + 8037 + 8038 — move `REGULAR_PER_AUTH_BASE_COST`
-  and the existence rule into 2780; strip state-gas language from 2780; move the
-  combined SSTORE table into 8037; fix stale §Mispricing/7904 text; state the composed
-  floor definition once in 8037 (findings 3–7, 16–17).
+- **PR b (de-circularization):** 2780 + 8037 + 8038 — in 2780, replace the inline
+  `STATE_BYTES_* × CPSB` products with the schedule symbols `GAS_NEW_ACCOUNT` /
+  `PER_AUTH_BASE_COST` (values and dimension owned by 8037) and drop `requires: 8037`;
+  move `REGULAR_PER_AUTH_BASE_COST` and the existence rule down into 2780; move the
+  combined SSTORE table from 8038 into 8037 and drop 8038's `requires: 8037, 7904`;
+  fix stale §Mispricing/7904 text; state the composed floor definition once in 8037
+  (findings 3–7, 16–17).
 - **PR c (peripheral integration):** 7928↔8246 recording rules; 7928/8037 BAL dimension
   note; 7708 constants + pricing ownership; 7954 note; 7997↔7610/8037 notes; escalate
   the 7843/7928 engine-API collision to execution-apis (findings 8–15, 18–19).
