@@ -1,6 +1,6 @@
 # Glamsterdam EL Devnet Review — Could We Have Had Fewer Devnets?
 
-Research conducted 2026-07-14 with Claude Code. Follow-up to `glamsterdam-fork-process-research.md` (2026-07-06). All data gathered read-only from ethpandaops HackMD notes and config repos (`bal-devnets`, `glamsterdam-devnets`, `epbs-devnets`), `ethereum/pm` (ACDT #62–87, ACDE #225–240), `ethereum/execution-specs` (EELS) and `ethereum/execution-spec-tests` (EEST) releases/issues/PRs, `ethereum/EIPs` git history and PRs, and client bug trackers. **Nothing was published anywhere.**
+Research conducted 2026-07-14 with Claude Code. Follow-up to `glamsterdam-fork-process-research.md` (2026-07-06). All data gathered read-only from ethpandaops HackMD notes and config repos (`bal-devnets`, `glamsterdam-devnets`, `epbs-devnets`), `ethereum/pm` (ACDT #62–87, ACDE #225–240), `ethereum/execution-specs` (EELS) and `ethereum/execution-spec-tests` (EEST) releases/issues/PRs, `ethereum/EIPs` git history and PRs, and client bug trackers. Raw snapshots of the downloaded material are archived in [fork-process-research-data/](fork-process-research-data/README.md) (see §9). **Nothing was published anywhere.**
 
 ## 1. Question
 
@@ -188,8 +188,10 @@ The earlier research's recommendations (gates that mean something, cluster-SFI, 
 
 ## 9. Sources
 
-- ethpandaops: `notes.ethereum.org/@ethpandaops/{bal,glamsterdam}-devnet-0…7` (raw copies in scratchpad), `github.com/ethpandaops/{bal,glamsterdam,epbs}-devnets` (genesis configs, git history).
-- `ethereum/pm`: ACDT #62–87 (issues #1820–#2151), ACDE #225–240, repricing breakouts; pre-scope ACDT #58–61; Fusaka-era baseline issues #1528–#1736 and PR #1715 (Protocol Upgrade Process doc).
+Raw source material is archived locally in [fork-process-research-data/](fork-process-research-data/README.md), including the four underlying research reports: [devnet notes & configs](fork-process-research-data/agent-report-devnet-notes-and-configs.md), [EELS/EEST feedback loop](fork-process-research-data/agent-report-eels-eest-feedback-loop.md), [ACDT devnet triggers](fork-process-research-data/agent-report-acdt-devnet-triggers.md), [Fusaka cadence baseline](fork-process-research-data/agent-report-fusaka-cadence-baseline.md).
+
+- ethpandaops: `notes.ethereum.org/@ethpandaops/{bal,glamsterdam}-devnet-0…7` (raw copies in [fork-process-research-data/devnet-notes/](fork-process-research-data/devnet-notes/)), `github.com/ethpandaops/{bal,glamsterdam,epbs}-devnets` (genesis configs, git history).
+- `ethereum/pm`: ACDT #62–87 (issues #1820–#2151), ACDE #225–240, repricing breakouts; pre-scope ACDT #58–61 (issue dumps in [fork-process-research-data/pm/](fork-process-research-data/pm/)); Fusaka-era baseline issues #1528–#1736 and PR #1715 (Protocol Upgrade Process doc; dumps in [fork-process-research-data/acdt/](fork-process-research-data/acdt/)).
 - EELS/EEST: release tags `bal@v1.0.0`…`tests-glamsterdam-devnet@v7.2.0`; issues/PRs #1846, #1912, #2040, #2363, #2578, #2687, #2689–#2733, #2744, #2748, #2804, #2827, #2901, #2915, #2945, #2972, #2990, #3001, #3017, #3020, #3048, #3064, #3126.
 - `ethereum/EIPs` PRs: #11117, #11181, #11292, #11328, #11399, #11421, #11475, #11476, #11522, #11532, #11540, #11548, #11570, #11573, #11586, #11596, #11611, #11616, #11626, #11627, #11634, #11645, #11696, #11699, #11715–#11718, #11750, #11759–#11760, #11783, #11802, #11807, #11818, #11823, #11844, #11854, #11858, #11891, #11899, #11902, #11906, #11908; local git history of all in-scope EIPs.
 - Client trackers: go-ethereum#33735/#33972, besu#9994, nimbus-eth1#4036, erigon#22038/#22152/#22254, lighthouse#8726, lodestar#9415/#9475/#9477/#9562/#9596; consensus-specs#4858/#4979/#5307/#5348/#5355/#5399; execution-apis#691/#727/#731/#770/#786/#794/#796; potuz.net epbs-devnet-0 post-mortem.
