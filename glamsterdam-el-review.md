@@ -1,21 +1,30 @@
 # Glamsterdam EL EIP review — dependency tree, ownership, and required changes
 
-**Base commit (ethereum/EIPs `master`): `2e7e88bb8dc0ead4db7726ac6af89f576c221d93`**
+**Base commit (ethereum/EIPs `master`): `68898156500eea7389cf65d746b64c7dd27e4bc1`**
+(merged into this branch; all findings, line numbers, and pinned links below refer to
+that commit, so they stay valid as master moves.)
 
-All findings, line numbers, and links below refer to that commit. One item is already
-addressed by [PR 11908](https://github.com/ethereum/EIPs/pull/11908) (branch
-`eip-8037-updates-interaction`, commit `bcce075b`): the EIP-7623/7976 calldata floor was
-missing from EIP-8037's two-dimensional *block* accounting, letting data-heavy
-transactions contribute only their pre-floor gas to `block_regular_gas_used`. Everything
-else is still open on master.
+History: the original review was done at `2e7e88bb`; since then PR 11908 (calldata floor
+in EIP-8037 block accounting) was merged as `190d539c`, and EIP-7773 was restructured in
+`e338bc94` (CFI/PFI tiers dissolved). Two findings of the original review were resolved
+by that restructure and are kept below, marked **RESOLVED**, as a record.
 
-Scope — EL EIPs in [EIP-7773](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7773.md) not Declined for Inclusion:
+This document tracks what must change to (a) make the Glamsterdam EL specifications
+mutually consistent and free of circular dependencies, and (b) unblock moving EIP-7773
+and its listed EIPs to Review (PR 11855, currently failing eipw because listed EIPs are
+still Draft).
 
-- **Scheduled:** 7708, 7778, 7843, 7928, 7954, 7976, 7981, 8024, 8037
-- **Considered:** 2780, 7904, 7997, 8038, 8246
-- **Proposed:** 7610, 7979, 8163
+Scope — EIPs listed in
+[EIP-7773](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7773.md)
+outside Declined for Inclusion:
 
-(7732 is CL-dominant; 7688/8045/8061/8080 are CL; 7975/8070/8136/8159/8189 are networking — out of scope here.)
+- **Scheduled, EL-relevant:** 7708, 7778, 7843, 7928, 7954, 7976, 7981, 8024, 8037,
+  2780, 7610, 7997, 8038, 8246
+- **Scheduled, CL-dominant (out of EL scope here):** 7732, 7688, 8045, 8061, 8282
+- **Other EIPs:** networking 7975, 8070, 8159; informational 7904
+
+Note: 7979 is now Declined and 8163 is no longer listed at all — both dropped from this
+review's scope (a few historical notes about them remain, marked as out of scope).
 
 ---
 
@@ -30,11 +39,40 @@ Scope — EL EIPs in [EIP-7773](https://github.com/ethereum/EIPs/blob/2e7e88bb8d
    restates the fully-composed formulas — that is what makes the fork implementable from
    the EIPs alone, without reverse-engineering tests.
 
-## 2. Proposed dependency tree
+## 2. Circular dependencies (the blocker)
 
-The tree below shows the proposed in-fork `requires:` graph after cleanup (it is a DAG;
-an EIP appearing more than once is the same node, marked "as above"). An edge means the
-lower EIP must be readable and implementable first; the upper EIP is a diff against it.
+Tarjan SCC over the full transitive `requires:` closure of every non-DFI EIP in 7773, at
+the base commit, finds **exactly one cycle cluster — the gas trio**:
+
+```text
+┌─────────────────────────────────────┐
+│   2780 ──▶ 8037      2780 ──▶ 8038  │
+│   8037 ──▶ 2780      8037 ──▶ 8038  │
+│                      8038 ──▶ 8037  │
+└─────────────────────────────────────┘
+SCC = {2780, 8037, 8038}
+```
+
+The SCC contains three elementary cycles: `2780 ⇄ 8037`, `8037 ⇄ 8038`, and the 3-cycle
+`8038 → 8037 → 2780 → 8038`. Two edge removals are each necessary and jointly
+sufficient:
+
+1. **Remove 2780 → 8037** via symbol indirection (§3): 2780 charges the schedule symbols
+   `GAS_NEW_ACCOUNT` / `PER_AUTH_BASE_COST` (state component); 8037's existing
+   Parameter-changes table owns their values (`STATE_BYTES_* × CPSB`) and the state-gas
+   dimension. Charged amounts are unchanged (183,600 for a new account).
+2. **Remove 8038 → 8037** by moving the combined regular+state SSTORE table up into
+   8037; 8038 keeps a purely regular-gas table.
+
+The surviving edges (`2780 → 8038`, `8037 → 2780`, `8037 → 8038`) are acyclic, which
+also kills the 3-cycle. No other cycle exists anywhere in the closure, including through
+non-Glamsterdam EIPs.
+
+## 3. Proposed dependency tree
+
+The tree shows the proposed in-fork `requires:` graph after cleanup (it is a DAG; an EIP
+appearing more than once is the same node, marked "as above"). An edge means the lower
+EIP must be readable and implementable first; the upper EIP is a diff against it.
 Pre-fork dependencies (7623, 2930, 7702, 7825, 1014, …) are omitted except where they
 explain an edge.
 
@@ -69,15 +107,13 @@ No in-fork requires (self-contained):
   7954  code/initcode size limits  (informative note on 8037 code-deposit bound)
   7997  factory predeploy → 1014  (informative notes on 7610 and 8037)
   8024  DUPN/SWAPN/EXCHANGE
-  8163  reserve EXTENSION 0xae
-  7979  CALLSUB/ENTERSUB/RETURNSUB  (validator must track the fork's opcode set)
   7904  Informational, no changes — must appear in NO requires chain
 ```
 
-Cycle check: all edges point downward in the listing order 7976/7928/8038/… → 7708/7981/7778
-→ 2780 → 8037; 8246 → 7928 and 7708 → 8246 introduce no back-edges. The `requires:`
-headers to change: 2780 drops 8037; 8038 drops 8037 and 7904; 8037 drops 7904 and adds
-7778.
+Cycle check: all edges point downward in the listing order 7976/7928/8038/… →
+7708/7981/7778 → 2780 → 8037; 8246 → 7928 and 7708 → 8246 introduce no back-edges. The
+`requires:` headers to change: 2780 drops 8037; 8038 drops 8037 and 7904; 8037 drops
+7904 and adds 7778.
 
 ### Why the 2780 ⇄ 8037 cycle breaks with 2780 *below* — via symbol indirection
 
@@ -110,6 +146,12 @@ just stops deriving that product inline.
   `PER_EMPTY_ACCOUNT_COST` — that 2780 would then delete and re-plumb: two rounds of
   churn, and exactly the interleaved-spec situation master has today.
 
+Naming nuance: 8037's table gives `PER_AUTH_BASE_COST` two components (state gas
+`STATE_BYTES_PER_AUTH_BASE × CPSB` plus regular `REGULAR_PER_AUTH_BASE_COST`), while
+2780's authorization processing charges only the state component at runtime. Cleanest is
+for 8037 to name the state component explicitly (e.g. `PER_AUTH_BASE_STATE_COST`) so
+2780 can charge one unambiguous symbol per charge, as with `GAS_NEW_ACCOUNT`.
+
 Net effect: charged amounts are unchanged from today's combined intent, both documents
 keep nearly all their current text, and the `requires:` arrow becomes one-directional
 (2780 no longer requires 8037; 8037 keeps requiring 2780).
@@ -121,7 +163,7 @@ keep nearly all their current text, and the `requires:` arrow becomes one-direct
 already carries the state-only version) and leave 8038 a purely regular-gas repricing
 with an informative pointer. 8038 then stands alone and could even ship without 8037.
 
-## 3. Ownership map
+## 4. Ownership map
 
 | EIP | Owns (single source of truth) | Must stop owning / restating |
 | --- | --- | --- |
@@ -136,129 +178,193 @@ with an informative pointer. 8038 then stands alone and could even ship without 
 | **8246** | SELFDESTRUCT finalization semantics | Should additionally carry its own BAL-recording rules (→7928) and a state-gas non-refill note (→8037) |
 | **7843** | SLOTNUM opcode, `slotNumber` header field | Engine-API version numbers (collide with 7928) |
 | **7954** | The two size limits | Needs informative note on the 8037 code-deposit bound (below) |
-| **7610 / 8163** | Collision rule / opcode reservation | Fine as-is |
+| **7610** | Creation-collision rule | Fine as-is |
 | **8024** | The three stack opcodes | Price symbolically (`GAS_VERYLOW`), not a literal 3 |
-| **7979** | CALLSUB/ENTERSUB/RETURNSUB + MAGIC validation | Price symbolically (literal 8/5/1 today); validator-update procedure across forks unspecified |
 | **7997** | The predeploy account + code | Silent on 7610 and on state-creation gas (below) |
 | **7904** | Nothing normative (Informational) | Must be removed from every `requires:` and every "updated by 7904" sentence |
 
-## 4. Findings — changes needed on master (`2e7e88bb`)
+## 5. Findings — changes needed on master (`68898156`)
 
 ### A. Meta / scheduling (EIP-7773)
 
-**1.** **EIP-7979 is listed under both Proposed and Declined** —
-   [eip-7773.md#L57](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7773.md#L57)
-   vs [eip-7773.md#L88](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7773.md#L88). Pick one.
+**1.** ~~EIP-7979 listed under both Proposed and Declined.~~ **RESOLVED** by `e338bc94`:
+7979 now appears only under Declined; 8163 was dropped from the lists entirely.
 
-**2.** **Status-tier inversions.** Scheduled EIPs require merely-Considered ones:
-   [8037](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L11) (SFI) requires 2780 + 8038 (CFI);
-   [7708](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7708.md#L11) (SFI) requires 8246 (CFI).
-   Either promote 2780/8038/8246 to SFI in 7773, or make the scheduled EIPs
-   self-contained. As written, 8037 and 7708 cannot ship without their CFI dependencies.
+**2.** ~~Status-tier inversions (Scheduled EIPs requiring merely-Considered ones).~~
+**RESOLVED** by `e338bc94`: the CFI/PFI tiers were dissolved; 2780, 7610, 7688, 7997,
+8038, 8045, 8061, 8246 (and new 8282) are Scheduled, so 8037→2780/8038 and 7708→8246 no
+longer cross tiers.
 
 ### B. Dependency cycles
 
 **3.** **2780 ⇄ 8037** —
-   [eip-2780.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L11) and
-   [eip-8037.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L11) require each other.
-   Fix via symbol indirection: 2780 charges the schedule symbols `GAS_NEW_ACCOUNT` /
-   `PER_AUTH_BASE_COST` — whose Glamsterdam values (`STATE_BYTES_* × CPSB`) and state-gas
-   dimension are defined by 8037's existing Parameter-changes table — and drops
-   `requires: 8037`; 8037 keeps requiring 2780. Charged amounts are unchanged
-   (183,600 for a new account), and neither spec is materially rewritten. See §2.
+[eip-2780.md#L11](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L11) and
+[eip-8037.md#L11](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L11) require each other.
+Fix via symbol indirection (§2, §3): 2780 charges `GAS_NEW_ACCOUNT` /
+`PER_AUTH_BASE_COST` (state component) and drops `requires: 8037`; 8037 keeps requiring
+2780. Charged amounts unchanged (183,600 for a new account).
 
 **4.** **8037 ⇄ 8038** —
-   [eip-8038.md#L11](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8038.md#L11) requires 8037 back.
-   Fix: move the combined SSTORE table
-   ([eip-8038.md#L70-L82](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8038.md#L70-L82))
-   and the `GAS_NEW_ACCOUNT` note
-   ([eip-8038.md#L94](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8038.md#L94)) up into 8037.
+[eip-8038.md#L11](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8038.md#L11) requires 8037 back.
+Fix: move the combined SSTORE table
+([eip-8038.md#L70-L82](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8038.md#L70-L82))
+and the `GAS_NEW_ACCOUNT` note
+([eip-8038.md#L94](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8038.md#L94)) up into 8037.
 
-**5.** **7904 is Informational with no changes** yet sits in the `requires:` of 8037 and 8038, and
-   [eip-8037.md#L56](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L56) still says
-   `PRECOMPILE_ECRECOVER` "is updated by EIP-7904". The 7,816 derivation of
-   `REGULAR_PER_AUTH_BASE_COST` only works with ecRecover at its current 3,000 — state 3,000 directly.
+**5.** **7904 is Informational with no changes** yet sits in the `requires:` of 8037 and
+8038, and
+[eip-8037.md#L56](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L56)
+still says `PRECOMPILE_ECRECOVER` "is updated by EIP-7904". The 7,816 derivation of
+`REGULAR_PER_AUTH_BASE_COST` only works with ecRecover at its current 3,000 — state
+3,000 directly. (7904 is at Review, so it does not block eipw; this is a
+correctness/ownership issue.)
 
 ### C. Cross-document contradictions
 
 **6.** **8037 contradicts 2780 (and itself) on where the account-creation charge lives.**
-   [eip-8037.md#L394](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L394) and
-   [eip-8037.md#L433](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L433) say 2780 adds it
-   **to intrinsic gas**; 2780
-   ([eip-2780.md#L115](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L115)) and 8037's own
-   §Transaction validation
-   ([eip-8037.md#L74-L81](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L74-L81)) make it a
-   **runtime** charge. Stale text from the previous 2780 revision.
+[eip-8037.md#L412](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L412) and
+[eip-8037.md#L451](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L451)
+say 2780 adds it **to intrinsic gas**; 2780
+([eip-2780.md#L115](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L115))
+and 8037's own §Transaction validation
+([eip-8037.md#L74-L81](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L74-L81))
+make it a **runtime** charge. Stale text from the previous 2780 revision.
 
 **7.** **7976 hardcodes the legacy base its neighbors replace.**
-   [eip-7976.md#L51-L63](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7976.md#L51-L63) uses literal
-   `21000` and `isContractCreation * 32000`; 2780 replaces the base
-   ([eip-2780.md#L143](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L143)) and 8037 replaces
-   `GAS_CREATE`. The composed floor (7976 rate + 7981 surcharge + 2780 base) is never
-   written normatively in one place, while 8037 consumes `calldata_floor_gas_cost`
-   without saying which composition it means. The top of the stack (8037) must state the
-   composed definition once; 7976 should switch to named symbols.
+[eip-7976.md#L51-L63](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7976.md#L51-L63)
+uses literal `21000` and `isContractCreation * 32000`; 2780 replaces the base
+([eip-2780.md#L143](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L143))
+and 8037 replaces `GAS_CREATE`. The composed floor (7976 rate + 7981 surcharge + 2780
+base) is never written normatively in one place, while 8037 consumes
+`calldata_floor_gas_cost` without saying which composition it means. The top of the
+stack (8037) must state the composed definition once; 7976 should switch to named
+symbols.
 
 **8.** **Name collision on `TX_BASE_COST`.**
-   [eip-7981.md#L104](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7981.md#L104) uses it for the
-   legacy 21,000; [eip-2780.md#L39](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L39)
-   defines it as 12,000. Also 7981's parameter table
-   ([eip-7981.md#L26-L30](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7981.md#L26-L30)) freezes
-   `2400`/`1900` per-entry costs that 8038 reprices to 3000/3000 — mark them as
-   referenced values owned by the schedule, not parameters of 7981.
+[eip-7981.md#L104](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7981.md#L104)
+uses it for the legacy 21,000;
+[eip-2780.md#L39](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L39)
+defines it as 12,000. Also 7981's parameter table
+([eip-7981.md#L26-L30](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7981.md#L26-L30))
+freezes `2400`/`1900` per-entry costs that 8038 reprices to 3000/3000 — mark them as
+referenced values owned by the schedule, not parameters of 7981.
 
 **9.** **Engine API collision between two Scheduled EIPs.**
-   [eip-7843.md#L51](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7843.md#L51) and
-   [eip-7928.md#L278-L292](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7928.md#L278-L292) both
-   define `ExecutionPayloadV4` and `engine_getPayloadV6` with different, mutually unaware
-   field sets. Both also add a header field (`slotNumber`, `block_access_list_hash`)
-   and no document owns the combined Amsterdam header RLP layout/ordering.
-   Recommendation: EIPs specify required fields only; version numbers and the combined
-   header layout are assigned in execution-apis / the fork spec, referenced from 7773.
+[eip-7843.md#L51](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7843.md#L51) and
+[eip-7928.md#L278-L292](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7928.md#L278-L292)
+both define `ExecutionPayloadV4` and `engine_getPayloadV6` with different, mutually
+unaware field sets. Both also add a header field (`slotNumber`,
+`block_access_list_hash`) and no document owns the combined Amsterdam header RLP
+layout/ordering. Recommendation: EIPs specify required fields only; version numbers and
+the combined header layout are assigned in execution-apis / the fork spec, referenced
+from 7773.
 
-**10.** **7928's SELFDESTRUCT edge case encodes deletion semantics that 8246 removes.** [eip-7928.md#L259](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7928.md#L259) says destroyed accounts are included "without nonce or code changes"; under [8246](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8246.md#L37-L44) the account survives with nonce reset to 0, cleared code, retained balance — a state-reconstructing BAL must record those. 8246 (the lower-certainty EIP) should own its BAL recording rules. Likewise [eip-8037.md#L157](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-8037.md#L157)'s claim that a same-tx selfdestructed account "is not included in the state trie" becomes false under 8246 when balance remains (the no-refill outcome stays correct; the justification needs rewording, and the storage-cleared-at-finalization ⇒ no-refill case should be stated).
+**10.** **7928's SELFDESTRUCT edge case encodes deletion semantics that 8246 removes.**
+[eip-7928.md#L259](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7928.md#L259)
+says destroyed accounts are included "without nonce or code changes"; under
+[8246](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8246.md#L37-L44)
+the account survives with nonce reset to 0, cleared code, retained balance — a
+state-reconstructing BAL must record those. 8246 should own its BAL recording rules.
+Likewise
+[eip-8037.md#L157](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L157)'s
+claim that a same-tx selfdestructed account "is not included in the state trie" becomes
+false under 8246 when balance remains (the no-refill outcome stays correct; the
+justification needs rewording, and the storage-cleared-at-finalization ⇒ no-refill case
+should be stated).
 
-**11.** **7928 constants drift under 8038 / dimension ambiguity under 8037.** `ITEM_COST` rationale cites cold SLOAD at 2,100 ([eip-7928.md#L126](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7928.md#L126)) and the phantom-read invariant uses 1900+100 ([eip-7928.md#L587](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7928.md#L587)). Both invariants stay sound (minimum costs only rise), but the claims go stale, and under 8037's two dimensions nobody says which counter "remaining block gas" means (it must be the regular dimension — every BAL item costs ≥ 3,000 regular gas even when its dominant cost is state gas). This integration note belongs in 8037.
+**11.** **7928 constants drift under 8038 / dimension ambiguity under 8037.**
+`ITEM_COST` rationale cites cold SLOAD at 2,100
+([eip-7928.md#L126](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7928.md#L126))
+and the phantom-read invariant uses 1900+100
+([eip-7928.md#L587](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7928.md#L587)).
+Both invariants stay sound (minimum costs only rise), but the claims go stale, and under
+8037's two dimensions nobody says which counter "remaining block gas" means (it must be
+the regular dimension — every BAL item costs ≥ 3,000 regular gas even when its dominant
+cost is state gas). This integration note belongs in 8037.
 
-**12.** **7928's pre-state table charges `GAS_CREATE` "as defined in EIP-2929"** ([eip-7928.md#L152-L153](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7928.md#L152-L153)); under 8037/8038 that becomes `CREATE_ACCESS` (regular, pre-state) plus the conditional post-access state charge. 8037 handles the semantics — 7928 should stay parametric so it cannot contradict.
+**12.** **7928's pre-state table charges `GAS_CREATE` "as defined in EIP-2929"**
+([eip-7928.md#L152-L153](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7928.md#L152-L153));
+under 8037/8038 that becomes `CREATE_ACCESS` (regular, pre-state) plus the conditional
+post-access state charge. 8037 handles the semantics — 7928 should stay parametric so it
+cannot contradict.
 
-**13.** **7954 × 8037: the 64 KiB limit is unreachable at current gas limits.** Code-deposit state gas is `L × CPSB` = 65,536 × 1,530 ≈ 100.3M, so a 64 KiB deployment needs a block gas limit above ~101M; at 60M the effective cap is ~38 KiB. Needs an informative note in [eip-7954.md](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7954.md) (or 8037).
+**13.** **7954 × 8037: the 64 KiB limit is unreachable at current gas limits.**
+Code-deposit state gas is `L × CPSB` = 65,536 × 1,530 ≈ 100.3M, so a 64 KiB deployment
+needs a block gas limit above ~101M; at 60M the effective cap is ~38 KiB. Needs an
+informative note in
+[eip-7954.md](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7954.md)
+(or 8037).
 
-**14.** **7997 is silent on 7610 and on state-creation gas.** [eip-7997.md](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7997.md) does not say that pre-existing storage at the factory address blocks the ordinary-tx install path under 7610 (the irregular-state path bypasses it), nor that 8037 re-breaks keyless (Nick's-method) deployment gas limits — which is precisely the interaction 8037's own §Deterministic deployment factories describes. Cross-link the two; scheduling 7997 *with* 8037 resolves the regression 8037 introduces.
+**14.** **7997 is silent on 7610 and on state-creation gas.**
+[eip-7997.md](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7997.md)
+does not say that pre-existing storage at the factory address blocks the ordinary-tx
+install path under 7610 (the irregular-state path bypasses it), nor that 8037 re-breaks
+keyless (Nick's-method) deployment gas limits — which is precisely the interaction
+8037's own §Deterministic deployment factories
+([eip-8037.md#L425](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-8037.md#L425))
+describes. Cross-link the two; scheduling 7997 *with* 8037 resolves the regression 8037
+introduces.
 
-**15.** **7708's gas claim goes stale and its log pricing ownership is implicit.** [eip-7708.md#L76](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-7708.md#L76) says transfers cost ≥ 6,700 (legacy `CALL_VALUE − stipend`); under 8038 the surcharge is `ACCOUNT_WRITE` = 8,000. 7708 should also state explicitly that opcode-level transfer logs carry no new charge and that the transaction-level log is priced by 2780's `TRANSFER_LOG_COST` (= 1,756, [eip-2780.md#L41](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L41)).
+**15.** **7708's gas claim goes stale and its log pricing ownership is implicit.**
+[eip-7708.md#L76](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-7708.md#L76)
+says transfers cost ≥ 6,700 (legacy `CALL_VALUE − stipend`); under 8038 the surcharge is
+`ACCOUNT_WRITE` = 8,000. 7708 should also state explicitly that opcode-level transfer
+logs carry no new charge and that the transaction-level log is priced by 2780's
+`TRANSFER_LOG_COST` (= 1,756,
+[eip-2780.md#L41](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L41)).
 
 ### D. Editorial defects
 
-**16.** **2780 Abstract sentence truncated** — [eip-2780.md#L16](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L16): "…while ETH transfers to new accounts and 7702-related transactions" (no predicate).
+**16.** **2780 Abstract sentence truncated** —
+[eip-2780.md#L16](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L16):
+"…while ETH transfers to new accounts and 7702-related transactions" (no predicate).
 
-**17.** **Stray `=`** at the end of [eip-2780.md#L73](https://github.com/ethereum/EIPs/blob/2e7e88bb8dc0ead4db7726ac6af89f576c221d93/EIPS/eip-2780.md#L73).
+**17.** **Stray `=`** at the end of
+[eip-2780.md#L73](https://github.com/ethereum/EIPs/blob/68898156500eea7389cf65d746b64c7dd27e4bc1/EIPS/eip-2780.md#L73).
 
-**18.** **Literal opcode gas prices that repricing strands:** 8024's "Charge 3 gas" (intent is parity with `DUP*`/`SWAP*` — say `GAS_VERYLOW`), 7979's literal 8/5/1 (tier-keyed in prose but numeric in spec). 7979 additionally has TBD opcode bytes (0xB0–0xB2 placeholders) and an unspecified procedure for updating its canonical validator when a fork adds opcodes (8024, 8163, 7843) or deprecates them.
+**18.** **Literal opcode gas price that repricing strands:** 8024's "Charge 3 gas"
+(intent is parity with `DUP*`/`SWAP*` — say `GAS_VERYLOW`). (The equivalent 7979 finding
+is out of scope now that 7979 is Declined.)
 
-**19.** **Duplicate step numbering** in 8024's execution steps (two "5." steps per opcode).
+**19.** **Duplicate step numbering** in 8024's execution steps (two "5." steps per
+opcode).
 
-## 5. Status of PR 11908 relative to this list
+## 6. Moving to Review (PR 11855 unblock plan)
 
-PR 11908 (commit `bcce075b`, one commit on top of `2e7e88bb`) fixes the calldata-floor
-hole in 8037's block-level accounting: `tx_regular_gas` now takes
-`max(…, calldata_floor_gas_cost)` in both the standalone and the EIP-7778-integrated
-formulas, with rationale sections "Calldata floor in block accounting" and "State-gas
-refills under EIP-7778". It does **not** address any of findings 1–19; notably findings
-5, 6 (stale 7904/intrinsic text in 8037) touch the same file and could ride a follow-up
-to the same branch or a separate PR.
+eipw requires an EIP's `requires:` targets to be at ≥ its own status, and 7773's links
+must reach Review-or-later EIPs (DFI entries will be removed in the Review PR and are
+ignored). At the base commit, the still-Draft EIPs linked from 7773's non-DFI sections
+are: **7732, 7843, 2780, 8037, 8038, 8045, 8061, 8282, 7975, 8159, 8070**.
 
-## 6. Suggested PR breakdown
+Move order implied by `requires:` (after the cycle fix of §2):
 
-- **PR a (meta):** 7773 — resolve the 7979 double listing; promote or annotate the
-  2780/8038/8246 status inversions (findings 1–2).
-- **PR b (de-circularization):** 2780 + 8037 + 8038 — in 2780, replace the inline
-  `STATE_BYTES_* × CPSB` products with the schedule symbols `GAS_NEW_ACCOUNT` /
-  `PER_AUTH_BASE_COST` (values and dimension owned by 8037) and drop `requires: 8037`;
-  move `REGULAR_PER_AUTH_BASE_COST` and the existence rule down into 2780; move the
-  combined SSTORE table from 8038 into 8037 and drop 8038's `requires: 8037, 7904`;
-  fix stale §Mispricing/7904 text; state the composed floor definition once in 8037
-  (findings 3–7, 16–17).
+1. **8038** (its only non-Final require left is 7904, already Review)
+2. **2780** (requires 8038 + 7708/7928/7976 — all then Review)
+3. **8037** (requires 2780, 8038, 7976, 7981, 7778, 7928 — all then Review)
+4. **7732** before **8282** (8282 requires 7732)
+5. **7975 → 8159 → 8070** (chain of requires)
+6. **7843**, **8045** — free to move anytime
+
+Blockers found:
+
+- The `{2780, 8037, 8038}` cycle (§2) makes any per-EIP move order impossible until the
+  two edges are removed — this is the first work item.
+- **8061 requires EIP-7521, whose status is `Moved`** — eipw will reject 8061's move to
+  Review until that reference is dropped or replaced.
+
+## 7. Suggested PR breakdown
+
+- **PR a (meta):** ~~7773 double listing + tier inversions~~ — **done** via `e338bc94`.
+  Remaining meta work happens in PR 11855 itself (status → Review, drop DFI list).
+- **PR b (de-circularization, unblocks the Review sequence):** 2780 + 8037 + 8038 — in
+  2780, replace the inline `STATE_BYTES_* × CPSB` products with the schedule symbols
+  `GAS_NEW_ACCOUNT` / `PER_AUTH_BASE_COST` (values and dimension owned by 8037) and drop
+  `requires: 8037`; move `REGULAR_PER_AUTH_BASE_COST` and the existence rule down into
+  2780; move the combined SSTORE table from 8038 into 8037 and drop 8038's
+  `requires: 8037, 7904`; fix stale §Mispricing/7904 text; state the composed floor
+  definition once in 8037 (findings 3–7, 16–17).
 - **PR c (peripheral integration):** 7928↔8246 recording rules; 7928/8037 BAL dimension
   note; 7708 constants + pricing ownership; 7954 note; 7997↔7610/8037 notes; escalate
   the 7843/7928 engine-API collision to execution-apis (findings 8–15, 18–19).
+- **PR d (Review moves):** status bumps in the §6 order, plus the 8061→7521 fix
+  (CL-side).
